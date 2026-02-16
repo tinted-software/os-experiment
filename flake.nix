@@ -1,10 +1,15 @@
 {
   inputs = {
-    nixpkgs.url = "github:tinted-software/nixpkgs/theoparis/swift";
+    nixpkgs.url = "github:reckenrode/nixpkgs/swift-update-mk2";
+  };
+
+  nixConfig = {
+    substituters = [ "https://cache.garnix.io" ];
+    trusted-public-keys = [ "cache.garnix.io:CTFPyKSLcx5RMJKfLo5EEPUObbA78b0YQ2DTCJXqr9g=" ];
   };
 
   outputs =
-    { self, nixpkgs, ... }:
+    { nixpkgs, ... }:
     let
       eachSystem = nixpkgs.lib.genAttrs [
         "x86_64-linux"
@@ -17,7 +22,7 @@
     {
       packages = eachSystem (
         system: with nixpkgs.legacyPackages.${system}; {
-          kernel = callPackage ./nix/kernel.nix { inherit self; };
+          kernel = callPackage ./kernel { };
         }
       );
     };

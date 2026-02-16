@@ -1,7 +1,5 @@
 {
   lib,
-  self,
-  fetchFromGitHub,
   swiftPackages,
   stdenvNoLibc,
 }:
@@ -13,7 +11,7 @@ stdenvNoLibc.mkDerivation (finalAttrs: {
   pname = "kernel";
   version = "0.1.0";
 
-  src = self;
+  src = ./.;
 
   nativeBuildInputs = [
     swift
