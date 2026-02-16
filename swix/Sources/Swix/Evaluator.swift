@@ -203,6 +203,20 @@ public struct Evaluator: Sendable {
         return try eval(expr, env: Env())
     }
 
+    /// Parse and evaluate a Nix expression string in a given environment.
+    public func eval(_ source: String, env: Env) throws -> Value {
+        var parser = Parser(source: source)
+        let expr = try parser.parse()
+        return try eval(expr, env: env)
+    }
+
+    /// Evaluate a Nix file, returning its value.
+    public func evalFile(_ path: String, env: Env) throws -> Value {
+        let url = URL(fileURLWithPath: path)
+        let source = try String(contentsOf: url, encoding: .utf8)
+        return try eval(source, env: env)
+    }
+
     /// Evaluate an AST expression in the given environment.
     public func eval(_ expr: Expr, env: Env) throws -> Value {
         switch expr {
@@ -320,7 +334,7 @@ public struct Evaluator: Sendable {
     }
 
     /// Coerce a value to string for string interpolation.
-    private func coerceToString(_ val: Value) throws -> String {
+    public func coerceToString(_ val: Value) throws -> String {
         switch val {
         case .string(let s): return s
         case .int(let n): return "\(n)"
@@ -543,7 +557,19 @@ public struct Evaluator: Sendable {
         }
     }
 
-    private func applyClosure(_ closure: ClosureVal, arg: Value) throws -> Value {
+    /// Apply any function value (closure or builtin) to an argument.
+    public func applyFunction(_ fn: Value, arg: Value) throws -> Value {
+        switch fn {
+        case .closure(let closure):
+            return try applyClosure(closure, arg: arg)
+        case .builtin(_, let bfn):
+            return try bfn(arg)
+        default:
+            throw EvalError(message: "attempt to call a non-function value: \(fn)")
+        }
+    }
+
+    public func applyClosure(_ closure: ClosureVal, arg: Value) throws -> Value {
         let bodyEnv: Env
 
         switch closure.param {
@@ -724,7 +750,7 @@ public struct Evaluator: Sendable {
         }
     }
 
-    private func valuesEqual(_ l: Value, _ r: Value) -> Bool {
+    public func valuesEqual(_ l: Value, _ r: Value) -> Bool {
         switch (l, r) {
         case (.int(let a), .int(let b)): return a == b
         case (.float(let a), .float(let b)): return a == b
