@@ -563,6 +563,11 @@ struct EvaluatorTests {
         if case .int(2) = val {} else { Issue.record("Expected 2, got \(val)") }
     }
 
+    @Test func nestedPathLet() throws {
+        let val = try eval("let a.b = 1; a.c = 2; in a.b + a.c")
+        if case .int(3) = val {} else { Issue.record("Expected 3, got \(val)") }
+    }
+
     // --- If/then/else ---
 
     @Test func ifTrue() throws {

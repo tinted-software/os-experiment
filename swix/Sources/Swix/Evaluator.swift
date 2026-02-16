@@ -417,15 +417,20 @@ public struct Evaluator: Sendable {
             attrSet.set(key, expr: value, env: env)
         } else {
             // Nested path: a.b.c = val -> create intermediate attrsets
-            // Check if key already exists as an attrset
+            let nested: AttrSetVal
             if attrSet.has(key) {
-                // For nested merging, we'd need to force and merge.
-                // For simplicity, just create nested.
+                // If it already exists, it must be an attrset to allow nesting.
+                let existing = try attrSet.force(key, evaluator: self)
+                guard case .attrSet(let existingSet) = existing else {
+                    throw EvalError(message: "attribute '\(key)' already defined and is not an attribute set")
+                }
+                nested = existingSet
+            } else {
+                nested = AttrSetVal()
+                attrSet.set(key, value: .attrSet(nested))
             }
-            let nested = AttrSetVal()
             let remaining = Array(path.dropFirst())
             try setBinding(nested, path: remaining, value: value, env: env)
-            attrSet.set(key, value: .attrSet(nested))
         }
     }
 
@@ -515,11 +520,7 @@ public struct Evaluator: Sendable {
         let letEnv = AttrSetEnv(attrSet: letSet, evaluator: self, parent: env)
 
         for binding in bindings {
-            guard binding.path.count == 1 else {
-                throw EvalError(message: "nested attribute paths in let bindings are not supported")
-            }
-            let name = try attrKeyToString(binding.path[0])
-            letSet.set(name, expr: binding.value, env: letEnv)
+            try setBinding(letSet, path: binding.path, value: binding.value, env: letEnv)
         }
 
         return try eval(body, env: letEnv)
