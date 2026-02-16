@@ -20,7 +20,7 @@ public struct FlakeEvaluator: Sendable {
 
     /// Evaluate a flake.nix at the given directory, returning the full flake output attrset.
     /// Input fetching is stubbed: each input is provided as a stub attrset with metadata.
-    public func evalFlake(at directory: String) throws -> Value {
+    public func evalFlake(at directory: String) async throws -> Value {
         let flakePath = (directory as NSString).appendingPathComponent("flake.nix")
 
         guard FileManager.default.fileExists(atPath: flakePath) else {
@@ -31,7 +31,7 @@ public struct FlakeEvaluator: Sendable {
         let env = Builtins.baseEnv(evaluator: evaluator)
 
         // Parse and evaluate the flake.nix expression
-        let flakeExpr = try evaluator.eval(source, env: env)
+        let flakeExpr = try await evaluator.eval(source, env: env)
 
         guard case .attrSet(let flakeSet) = flakeExpr else {
             throw EvalError(message: "flake.nix must evaluate to an attribute set")
@@ -42,23 +42,23 @@ public struct FlakeEvaluator: Sendable {
             throw EvalError(message: "flake.nix is missing 'outputs' attribute")
         }
 
-        let outputsFn = try flakeSet.force("outputs", evaluator: evaluator)
+        let outputsFn = try await flakeSet.force("outputs", evaluator: evaluator)
 
         // Build the stubbed inputs
-        let inputs = try buildStubbedInputs(flakeSet: flakeSet, flakeDir: directory)
+        let inputs = try await buildStubbedInputs(flakeSet: flakeSet, flakeDir: directory)
 
         // Call the outputs function with the inputs
-        let outputsVal = try Builtins.applyFn(outputsFn, arg: inputs, evaluator: evaluator)
+        let outputsVal = try await Builtins.applyFn(outputsFn, arg: inputs, evaluator: evaluator)
 
         return outputsVal
     }
 
     /// Get metadata about a flake without fully evaluating outputs.
-    public func flakeMetadata(at directory: String) throws -> FlakeMetadata {
+    public func flakeMetadata(at directory: String) async throws -> FlakeMetadata {
         let flakePath = (directory as NSString).appendingPathComponent("flake.nix")
         let source = try String(contentsOfFile: flakePath, encoding: .utf8)
         let env = Builtins.baseEnv(evaluator: evaluator)
-        let flakeExpr = try evaluator.eval(source, env: env)
+        let flakeExpr = try await evaluator.eval(source, env: env)
 
         guard case .attrSet(let flakeSet) = flakeExpr else {
             throw EvalError(message: "flake.nix must evaluate to an attribute set")
@@ -67,7 +67,7 @@ public struct FlakeEvaluator: Sendable {
         // Description
         var description: String? = nil
         if flakeSet.has("description") {
-            if case .string(let desc) = try flakeSet.force("description", evaluator: evaluator) {
+            if case .string(let desc) = try await flakeSet.force("description", evaluator: evaluator) {
                 description = desc
             }
         }
@@ -75,7 +75,7 @@ public struct FlakeEvaluator: Sendable {
         // Input names
         var inputNames: [String] = []
         if flakeSet.has("inputs") {
-            if case .attrSet(let inputsSet) = try flakeSet.force("inputs", evaluator: evaluator) {
+            if case .attrSet(let inputsSet) = try await flakeSet.force("inputs", evaluator: evaluator) {
                 inputNames = inputsSet.keys.sorted()
             }
         }
@@ -83,9 +83,9 @@ public struct FlakeEvaluator: Sendable {
         // Try to get output attr names by calling with stubs
         var outputAttrNames: [String] = []
         if flakeSet.has("outputs") {
-            let outputsFn = try flakeSet.force("outputs", evaluator: evaluator)
-            let inputs = try buildStubbedInputs(flakeSet: flakeSet, flakeDir: directory)
-            if let outputsVal = try? Builtins.applyFn(outputsFn, arg: inputs, evaluator: evaluator),
+            let outputsFn = try await flakeSet.force("outputs", evaluator: evaluator)
+            let inputs = try await buildStubbedInputs(flakeSet: flakeSet, flakeDir: directory)
+            if let outputsVal = try? await Builtins.applyFn(outputsFn, arg: inputs, evaluator: evaluator),
                case .attrSet(let outputsSet) = outputsVal {
                 outputAttrNames = outputsSet.keys.sorted()
             }
@@ -99,8 +99,8 @@ public struct FlakeEvaluator: Sendable {
     }
 
     /// Evaluate a specific output path from a flake (e.g., "packages.x86_64-linux.hello").
-    public func evalFlakeOutput(at directory: String, path: [String]) throws -> Value {
-        let outputs = try evalFlake(at: directory)
+    public func evalFlakeOutput(at directory: String, path: [String]) async throws -> Value {
+        let outputs = try await evalFlake(at: directory)
         var current = outputs
         for key in path {
             guard case .attrSet(let s) = current else {
@@ -109,7 +109,7 @@ public struct FlakeEvaluator: Sendable {
             guard s.has(key) else {
                 throw EvalError(message: "attribute '\(key)' not found in flake output")
             }
-            current = try s.force(key, evaluator: evaluator)
+            current = try await s.force(key, evaluator: evaluator)
         }
         return current
     }
@@ -117,8 +117,8 @@ public struct FlakeEvaluator: Sendable {
     // MARK: - Pretty-print flake show
 
     /// Generate a tree representation of flake outputs (like `nix flake show`).
-    public func flakeShow(at directory: String) throws -> String {
-        let outputs = try evalFlake(at: directory)
+    public func flakeShow(at directory: String) async throws -> String {
+        let outputs = try await evalFlake(at: directory)
         guard case .attrSet(let outputsSet) = outputs else {
             return "(flake outputs is not an attribute set)"
         }
@@ -132,14 +132,14 @@ public struct FlakeEvaluator: Sendable {
             let prefix = isLast ? "└───" : "├───"
             let childPrefix = isLast ? "    " : "│   "
 
-            let val = try? outputsSet.force(key, evaluator: evaluator)
-            appendFlakeTree(key: key, value: val, prefix: prefix, childPrefix: childPrefix, lines: &lines)
+            let val = try? await outputsSet.force(key, evaluator: evaluator)
+            await appendFlakeTree(key: key, value: val, prefix: prefix, childPrefix: childPrefix, lines: &lines)
         }
 
         return lines.joined(separator: "\n")
     }
 
-    private func appendFlakeTree(key: String, value: Value?, prefix: String, childPrefix: String, lines: inout [String]) {
+    private func appendFlakeTree(key: String, value: Value?, prefix: String, childPrefix: String, lines: inout [String]) async {
         guard let value = value else {
             lines.append("\(prefix) \(key): «error»")
             return
@@ -154,7 +154,7 @@ public struct FlakeEvaluator: Sendable {
             }
 
             // Detect known flake output types
-            let outputType = detectOutputType(key: key, attrSet: s)
+            let outputType = await detectOutputType(key: key, attrSet: s)
             if let type = outputType {
                 lines.append("\(prefix) \(key): \(type)")
                 return
@@ -165,8 +165,8 @@ public struct FlakeEvaluator: Sendable {
                 let isChildLast = (j == childKeys.count - 1)
                 let cp = isChildLast ? "\(childPrefix)└───" : "\(childPrefix)├───"
                 let ccp = isChildLast ? "\(childPrefix)    " : "\(childPrefix)│   "
-                let childVal = try? s.force(childKey, evaluator: evaluator)
-                appendFlakeTree(key: childKey, value: childVal, prefix: cp, childPrefix: ccp, lines: &lines)
+                let childVal = try? await s.force(childKey, evaluator: evaluator)
+                await appendFlakeTree(key: childKey, value: childVal, prefix: cp, childPrefix: ccp, lines: &lines)
             }
 
         case .closure, .builtin:
@@ -181,15 +181,15 @@ public struct FlakeEvaluator: Sendable {
     }
 
     /// Detect common flake output types based on attribute set contents.
-    private func detectOutputType(key: String, attrSet: AttrSetVal) -> String? {
+    private func detectOutputType(key: String, attrSet: AttrSetVal) async -> String? {
         // Check if it's a derivation (has `type = "derivation"`)
         if attrSet.has("type") {
-            if let typeVal = try? attrSet.force("type", evaluator: evaluator),
+            if let typeVal = try? await attrSet.force("type", evaluator: evaluator),
                case .string(let t) = typeVal {
                 if t == "derivation" {
-                    let name = (try? attrSet.force("name", evaluator: evaluator)).flatMap {
-                        if case .string(let n) = $0 { return n }; return nil
-                    } ?? "unknown"
+                    let nameVal = try? await attrSet.force("name", evaluator: evaluator)
+                    let name: String
+                    if let nv = nameVal, case .string(let n) = nv { name = n } else { name = "unknown" }
                     return "derivation '\(name)'"
                 }
                 return t
@@ -213,7 +213,7 @@ public struct FlakeEvaluator: Sendable {
 
     /// Build a stubbed input attrset for calling the flake's outputs function.
     /// Since we don't actually fetch inputs, we provide stub attrsets with metadata.
-    private func buildStubbedInputs(flakeSet: AttrSetVal, flakeDir: String) throws -> Value {
+    private func buildStubbedInputs(flakeSet: AttrSetVal, flakeDir: String) async throws -> Value {
         let inputsAttr = AttrSetVal()
 
         // "self" always refers to the flake's own source
@@ -229,9 +229,9 @@ public struct FlakeEvaluator: Sendable {
 
         // Process declared inputs
         if flakeSet.has("inputs") {
-            if case .attrSet(let declaredInputs) = try flakeSet.force("inputs", evaluator: evaluator) {
+            if case .attrSet(let declaredInputs) = try await flakeSet.force("inputs", evaluator: evaluator) {
                 for inputName in declaredInputs.keys {
-                    let stubInput = try makeInputStub(
+                    let stubInput = try await makeInputStub(
                         name: inputName,
                         spec: declaredInputs.force(inputName, evaluator: evaluator)
                     )
@@ -245,7 +245,7 @@ public struct FlakeEvaluator: Sendable {
 
     /// Create a stub input that mimics a fetched flake input.
     /// For nixpkgs-like inputs, provides a callable stub that returns a minimal pkgs set.
-    private func makeInputStub(name: String, spec: Value) throws -> AttrSetVal {
+    private func makeInputStub(name: String, spec: Value) async throws -> AttrSetVal {
         let stub = AttrSetVal()
         stub.set("outPath", value: .string("/nix/store/stub-\(name)"))
         stub.set("sourceInfo", value: .attrSet(makeSourceInfo("/nix/store/stub-\(name)")))
@@ -257,7 +257,7 @@ public struct FlakeEvaluator: Sendable {
 
         // For nixpkgs, provide a lib stub and make it callable
         if name == "nixpkgs" || name.hasPrefix("nixpkgs") {
-            let lib = makeLibStub()
+            let lib = await makeLibStub()
             stub.set("lib", value: .attrSet(lib))
 
             // nixpkgs is typically called as a function: nixpkgs { system = ...; }
@@ -266,7 +266,7 @@ public struct FlakeEvaluator: Sendable {
             // We provide `legacyPackages` as a stub.
             let legacyPackages = AttrSetVal()
             for system in ["x86_64-linux", "aarch64-linux", "x86_64-darwin", "aarch64-darwin"] {
-                legacyPackages.set(system, value: .attrSet(makePkgsStub(system: system)))
+                legacyPackages.set(system, value: .attrSet(await makePkgsStub(system: system)))
             }
             stub.set("legacyPackages", value: .attrSet(legacyPackages))
         }
@@ -275,7 +275,7 @@ public struct FlakeEvaluator: Sendable {
     }
 
     /// Create a minimal `lib` stub with commonly-used functions.
-    private func makeLibStub() -> AttrSetVal {
+    private func makeLibStub() async -> AttrSetVal {
         let lib = AttrSetVal()
 
         // lib.genAttrs: [names] -> (name -> value) -> attrset
@@ -289,7 +289,7 @@ public struct FlakeEvaluator: Sendable {
                     guard case .string(let name) = nameVal else {
                         throw EvalError(message: "lib.genAttrs: names must be strings")
                     }
-                    let val = try Builtins.applyFn(fn, arg: .string(name), evaluator: self.evaluator)
+                    let val = try await Builtins.applyFn(fn, arg: .string(name), evaluator: self.evaluator)
                     result.set(name, value: val)
                 }
                 return .attrSet(result)
@@ -319,9 +319,9 @@ public struct FlakeEvaluator: Sendable {
                 guard case .attrSet(let s) = v2 else { throw EvalError(message: "lib.mapAttrs: expected set") }
                 let result = AttrSetVal()
                 for key in s.keys {
-                    let val = try s.force(key, evaluator: self.evaluator)
-                    let partial = try Builtins.applyFn(fn, arg: .string(key), evaluator: self.evaluator)
-                    let mapped = try Builtins.applyFn(partial, arg: val, evaluator: self.evaluator)
+                    let val = try await s.force(key, evaluator: self.evaluator)
+                    let partial = try await Builtins.applyFn(fn, arg: .string(key), evaluator: self.evaluator)
+                    let mapped = try await Builtins.applyFn(partial, arg: val, evaluator: self.evaluator)
                     result.set(key, value: mapped)
                 }
                 return .attrSet(result)
@@ -334,9 +334,9 @@ public struct FlakeEvaluator: Sendable {
                 guard case .attrSet(let s) = v2 else { throw EvalError(message: "lib.filterAttrs: expected set") }
                 let result = AttrSetVal()
                 for key in s.keys {
-                    let val = try s.force(key, evaluator: self.evaluator)
-                    let partial = try Builtins.applyFn(fn, arg: .string(key), evaluator: self.evaluator)
-                    let keep = try Builtins.applyFn(partial, arg: val, evaluator: self.evaluator)
+                    let val = try await s.force(key, evaluator: self.evaluator)
+                    let partial = try await Builtins.applyFn(fn, arg: .string(key), evaluator: self.evaluator)
+                    let keep = try await Builtins.applyFn(partial, arg: val, evaluator: self.evaluator)
                     if case .bool(true) = keep { result.set(key, value: val) }
                 }
                 return .attrSet(result)
@@ -350,7 +350,11 @@ public struct FlakeEvaluator: Sendable {
         })
         lib.set("attrValues", value: .builtin("lib.attrValues") { v in
             guard case .attrSet(let s) = v else { throw EvalError(message: "lib.attrValues: expected set") }
-            return .list(try s.keys.sorted().map { try s.force($0, evaluator: self.evaluator) })
+            var results: [Value] = []
+            for key in s.keys.sorted() {
+                results.append(try await s.force(key, evaluator: self.evaluator))
+            }
+            return .list(results)
         })
 
         // lib.optional / lib.optionals
@@ -389,11 +393,11 @@ public struct FlakeEvaluator: Sendable {
                 guard case .attrSet(let s) = v2 else { throw EvalError(message: "lib.concatMapAttrs: expected set") }
                 let result = AttrSetVal()
                 for key in s.keys {
-                    let val = try s.force(key, evaluator: self.evaluator)
-                    let partial = try Builtins.applyFn(fn, arg: .string(key), evaluator: self.evaluator)
-                    let mapped = try Builtins.applyFn(partial, arg: val, evaluator: self.evaluator)
+                    let val = try await s.force(key, evaluator: self.evaluator)
+                    let partial = try await Builtins.applyFn(fn, arg: .string(key), evaluator: self.evaluator)
+                    let mapped = try await Builtins.applyFn(partial, arg: val, evaluator: self.evaluator)
                     if case .attrSet(let ms) = mapped {
-                        for mk in ms.keys { result.set(mk, value: try ms.force(mk, evaluator: self.evaluator)) }
+                        for mk in ms.keys { result.set(mk, value: try await ms.force(mk, evaluator: self.evaluator)) }
                     }
                 }
                 return .attrSet(result)
@@ -411,47 +415,50 @@ public struct FlakeEvaluator: Sendable {
         return lib
     }
 
-    private func makePkgsStub(system: String) -> AttrSetVal {
+    private func makePkgsStub(system: String) async -> AttrSetVal {
         let pkgs = AttrSetVal()
         pkgs.set("system", value: .string(system))
         // mkDerivation stub
-        pkgs.set("stdenv", value: .attrSet({
-            let stdenv = AttrSetVal()
-            stdenv.set("mkDerivation", value: .builtin("mkDerivation") { args in
-                guard case .attrSet(let a) = args else {
-                    throw EvalError(message: "mkDerivation: expected attribute set")
-                }
-                let result = AttrSetVal()
-                result.set("type", value: .string("derivation"))
-                let name = (try? a.force("pname", evaluator: self.evaluator))
-                    ?? (try? a.force("name", evaluator: self.evaluator))
-                    ?? .string("unknown")
-                result.set("name", value: name)
-                result.set("system", value: .string(system))
-                if case .string(let n) = name {
-                    result.set("outPath", value: .string("/nix/store/stub-\(n)"))
-                    result.set("drvPath", value: .string("/nix/store/stub-\(n).drv"))
-                }
-                // Copy version if present
-                if a.has("version"), let v = try? a.force("version", evaluator: self.evaluator) {
-                    result.set("version", value: v)
-                }
-                return .attrSet(result)
-            })
-            stdenv.set("system", value: .string(system))
-            stdenv.set("isDarwin", value: .bool(system.hasSuffix("-darwin")))
-            stdenv.set("isLinux", value: .bool(system.hasSuffix("-linux")))
-            return stdenv
-        }()))
+        let stdenv = AttrSetVal()
+        stdenv.set("mkDerivation", value: .builtin("mkDerivation") { args in
+            guard case .attrSet(let a) = args else {
+                throw EvalError(message: "mkDerivation: expected attribute set")
+            }
+            let result = AttrSetVal()
+            result.set("type", value: .string("derivation"))
+            let nameVal = try await a.force("pname", evaluator: self.evaluator)
+            var name: Value = nameVal
+            if case .null = name {
+                name = try await a.force("name", evaluator: self.evaluator)
+            }
+            if case .null = name { name = .string("unknown") }
+            
+            result.set("name", value: name)
+            result.set("system", value: .string(system))
+            if case .string(let n) = name {
+                result.set("outPath", value: .string("/nix/store/stub-\(n)"))
+                result.set("drvPath", value: .string("/nix/store/stub-\(n).drv"))
+            }
+            // Copy version if present
+            if a.has("version"), let v = try? await a.force("version", evaluator: self.evaluator) {
+                result.set("version", value: v)
+            }
+            return .attrSet(result)
+        })
+        stdenv.set("system", value: .string(system))
+        stdenv.set("isDarwin", value: .bool(system.hasSuffix("-darwin")))
+        stdenv.set("isLinux", value: .bool(system.hasSuffix("-linux")))
+        pkgs.set("stdenv", value: .attrSet(stdenv))
+        
         // callPackage stub
         pkgs.set("callPackage", value: .builtin("callPackage") { fn in
             return .builtin("callPackage") { _ in
                 // Try calling fn with an empty set if it's a function
                 if case .closure(let c) = fn {
                     let emptyArgs = AttrSetVal()
-                    emptyArgs.set("lib", value: .attrSet(self.makeLibStub()))
+                    emptyArgs.set("lib", value: .attrSet(await self.makeLibStub()))
                     emptyArgs.set("stdenv", value: .attrSet(AttrSetVal()))
-                    return (try? self.evaluator.applyClosure(c, arg: .attrSet(emptyArgs))) ?? .null
+                    return (try? await self.evaluator.applyClosure(c, arg: .attrSet(emptyArgs))) ?? .null
                 }
                 return fn
             }
@@ -468,7 +475,7 @@ public struct FlakeEvaluator: Sendable {
                 return .attrSet(r)
             }
         })
-        pkgs.set("lib", value: .attrSet(makeLibStub()))
+        pkgs.set("lib", value: .attrSet(await makeLibStub()))
         return pkgs
     }
 

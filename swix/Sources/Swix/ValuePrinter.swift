@@ -10,7 +10,7 @@ public struct ValuePrinter: Sendable {
     }
 
     /// Pretty-print a value as a Nix expression string.
-    public func print(_ value: Value, indent: Int = 0) -> String {
+    public func print(_ value: Value, indent: Int = 0) async -> String {
         switch value {
         case .int(let n):
             return "\(n)"
@@ -27,13 +27,19 @@ public struct ValuePrinter: Sendable {
         case .list(let elems):
             if elems.isEmpty { return "[ ]" }
             if elems.count <= 5 && elems.allSatisfy(isSimple) {
-                let items = elems.map { self.print($0) }.joined(separator: " ")
-                return "[ \(items) ]"
+                var items: [String] = []
+                for item in elems {
+                    items.append(await self.print(item))
+                }
+                return "[ \(items.joined(separator: " ")) ]"
             }
             let pad = String(repeating: "  ", count: indent + 1)
             let endPad = String(repeating: "  ", count: indent)
-            let items = elems.map { "\(pad)\(self.print($0, indent: indent + 1))" }.joined(separator: "\n")
-            return "[\n\(items)\n\(endPad)]"
+            var items: [String] = []
+            for item in elems {
+                items.append("\(pad)\(await self.print(item, indent: indent + 1))")
+            }
+            return "[\n\(items.joined(separator: "\n"))\n\(endPad)]"
         case .attrSet(let s):
             let keys = s.keys.sorted()
             if keys.isEmpty { return "{ }" }
@@ -41,8 +47,8 @@ public struct ValuePrinter: Sendable {
             let endPad = String(repeating: "  ", count: indent)
             var lines: [String] = []
             for key in keys {
-                let val = (try? s.force(key, evaluator: evaluator)) ?? .string("«error»")
-                let valStr = self.print(val, indent: indent + 1)
+                let val = (try? await s.force(key, evaluator: evaluator)) ?? .string("«error»")
+                let valStr = await self.print(val, indent: indent + 1)
                 let keyStr = needsQuoting(key) ? "\"\(escapeString(key))\"" : key
                 lines.append("\(pad)\(keyStr) = \(valStr);")
             }
@@ -55,8 +61,8 @@ public struct ValuePrinter: Sendable {
     }
 
     /// Print value as JSON.
-    public func printJSON(_ value: Value) -> String {
-        (try? Builtins.valueToJSON(value, evaluator: evaluator)) ?? "null"
+    public func printJSON(_ value: Value) async -> String {
+        (try? await Builtins.valueToJSON(value, evaluator: evaluator)) ?? "null"
     }
 
     private func escapeString(_ s: String) -> String {

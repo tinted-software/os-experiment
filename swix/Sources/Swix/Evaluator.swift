@@ -14,7 +14,7 @@ public indirect enum Value: Sendable, CustomStringConvertible {
     case list([Value])
     case attrSet(AttrSetVal)
     case closure(ClosureVal)
-    case builtin(String, @Sendable (Value) throws -> Value)
+    case builtin(String, @Sendable (Value) async throws -> Value)
 
     public var description: String {
         switch self {
@@ -28,8 +28,7 @@ public indirect enum Value: Sendable, CustomStringConvertible {
             let inner = elems.map(\.description).joined(separator: " ")
             return "[ \(inner) ]"
         case .attrSet(let a):
-            let keys = a.keys.sorted().joined(separator: " ")
-            return "{ \(keys) }"
+            return "{ \(a.keys.sorted().joined(separator: " ")) }"
         case .closure: return "«lambda»"
         case .builtin(let name, _): return "«builtin:\(name)»"
         }
@@ -55,14 +54,14 @@ public final class ClosureVal: @unchecked Sendable {
 
 /// A lazy attribute set. Fields are stored as thunks that are forced on first access.
 public final class AttrSetVal: @unchecked Sendable {
-    enum Thunk {
+    enum Thunk: Sendable {
         case unevaluated(Expr, Env)
         case evaluated(Value)
         case evaluating // cycle detection
     }
 
     private var fields: [String: Thunk]
-    private let lock = NSLock()
+    private let fieldsLock = NSRecursiveLock()
 
     public init() {
         self.fields = [:]
@@ -72,83 +71,129 @@ public final class AttrSetVal: @unchecked Sendable {
         self.fields = values.mapValues { .evaluated($0) }
     }
 
+    private func withLock<T>(_ body: () -> T) -> T {
+        fieldsLock.lock()
+        defer { fieldsLock.unlock() }
+        return body()
+    }
+
     /// Store a lazy thunk.
     public func set(_ key: String, expr: Expr, env: Env) {
-        lock.lock()
-        defer { lock.unlock() }
-        fields[key] = .unevaluated(expr, env)
+        withLock {
+            fields[key] = .unevaluated(expr, env)
+        }
     }
 
     /// Store an already-evaluated value.
     public func set(_ key: String, value: Value) {
-        lock.lock()
-        defer { lock.unlock() }
-        fields[key] = .evaluated(value)
+        withLock {
+            fields[key] = .evaluated(value)
+        }
     }
 
     /// Force a thunk, evaluating it if necessary.
-    public func force(_ key: String, evaluator: Evaluator) throws -> Value {
-        lock.lock()
-        guard let thunk = fields[key] else {
-            lock.unlock()
+    public func force(_ key: String, evaluator: Evaluator) async throws -> Value {
+        // Read thunk state
+        let thunk = withLock { fields[key] }
+        
+        guard let t = thunk else {
             throw EvalError(message: "attribute '\(key)' not found")
         }
 
-        switch thunk {
+        switch t {
         case .evaluated(let v):
-            lock.unlock()
             return v
         case .evaluating:
-            lock.unlock()
             throw EvalError(message: "infinite recursion detected evaluating attribute '\(key)'")
         case .unevaluated(let expr, let env):
-            fields[key] = .evaluating
-            lock.unlock()
-            let val = try evaluator.eval(expr, env: env)
-            lock.lock()
-            fields[key] = .evaluated(val)
-            lock.unlock()
+            // Mark as evaluating
+            withLock {
+                if case .unevaluated = fields[key] {
+                    fields[key] = .evaluating
+                }
+            }
+            
+            // Re-check after potentially marking
+            let currentThunk = withLock { fields[key] }
+            
+            if case .evaluated(let v) = currentThunk {
+                return v
+            }
+            
+            // Perform evaluation outside the lock
+            let val: Value
+            do {
+                val = try await evaluator.eval(expr, env: env)
+            } catch {
+                // Nix usually caches the failure. For now, just re-throw and clear evaluating state.
+                withLock {
+                    fields[key] = .unevaluated(expr, env)
+                }
+                throw error
+            }
+            
+            withLock {
+                fields[key] = .evaluated(val)
+            }
             return val
         }
     }
 
     /// Check if a key exists.
     public func has(_ key: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return fields[key] != nil
+        withLock { fields[key] != nil }
     }
 
     /// All keys in the set.
     public var keys: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return Array(fields.keys)
+        withLock { Array(fields.keys) }
     }
 
     /// Force all fields and return as dictionary.
-    public func toDict(evaluator: Evaluator) throws -> [String: Value] {
+    public func toDict(evaluator: Evaluator) async throws -> [String: Value] {
         var result: [String: Value] = [:]
         for key in keys {
-            result[key] = try force(key, evaluator: evaluator)
+            result[key] = try await force(key, evaluator: evaluator)
         }
         return result
+    }
+
+    /// Parallel version of toDict, evaluating all fields in parallel.
+    /// This is similar to Determinate Nix's parallel evaluation.
+    public func parallelToDict(evaluator: Evaluator) async throws -> [String: Value] {
+        let currentKeys = self.keys
+        return try await withThrowingTaskGroup(of: (String, Value).self) { group in
+            for key in currentKeys {
+                group.addTask {
+                    let val = try await self.force(key, evaluator: evaluator)
+                    return (key, val)
+                }
+            }
+
+            var result: [String: Value] = [:]
+            for try await (key, val) in group {
+                result[key] = val
+            }
+            return result
+        }
     }
 
     /// Merge with another attr set (right-biased, like //).
     public func update(with other: AttrSetVal) -> AttrSetVal {
         let result = AttrSetVal()
-        lock.lock()
-        for (k, v) in fields {
-            result.fields[k] = v
+        
+        let myFields = self.withLock { self.fields }
+        let otherFields = other.withLock { other.fields }
+        
+        result.withLock {
+            for (k, v) in myFields {
+                result.fields[k] = v
+            }
+            for (k, v) in otherFields {
+                result.fields[k] = v
+            }
         }
-        lock.unlock()
-
-        other.lock.lock()
-        for (k, v) in other.fields {
-            result.fields[k] = v
-        }
-        other.lock.unlock()
+        
         return result
     }
 }
@@ -197,28 +242,28 @@ public struct Evaluator: Sendable {
     public init() {}
 
     /// Parse and evaluate a Nix expression string.
-    public func eval(_ source: String) throws -> Value {
+    public func eval(_ source: String) async throws -> Value {
         var parser = Parser(source: source)
         let expr = try parser.parse()
-        return try eval(expr, env: Env())
+        return try await eval(expr, env: Env())
     }
 
     /// Parse and evaluate a Nix expression string in a given environment.
-    public func eval(_ source: String, env: Env) throws -> Value {
+    public func eval(_ source: String, env: Env) async throws -> Value {
         var parser = Parser(source: source)
         let expr = try parser.parse()
-        return try eval(expr, env: env)
+        return try await eval(expr, env: env)
     }
 
     /// Evaluate a Nix file, returning its value.
-    public func evalFile(_ path: String, env: Env) throws -> Value {
+    public func evalFile(_ path: String, env: Env) async throws -> Value {
         let url = URL(fileURLWithPath: path)
         let source = try String(contentsOf: url, encoding: .utf8)
-        return try eval(source, env: env)
+        return try await eval(source, env: env)
     }
 
     /// Evaluate an AST expression in the given environment.
-    public func eval(_ expr: Expr, env: Env) throws -> Value {
+    public func eval(_ expr: Expr, env: Env) async throws -> Value {
         switch expr {
         // Literals
         case .int(let n, _):
@@ -234,58 +279,61 @@ public struct Evaluator: Sendable {
             return .null
 
         case .string(let strExpr, _):
-            return try evalString(strExpr, env: env)
+            return try await evalString(strExpr, env: env)
 
         case .path(let p, _):
             return .path(p)
 
         // Identifier lookup
         case .ident(let name, _):
-            guard let val = env.lookup(name) else {
-                throw EvalError(message: "undefined variable '\(name)'")
+            if let val = try await lookupAsync(name, in: env) {
+                return val
             }
-            return val
+            throw EvalError(message: "undefined variable '\(name)'")
 
         // List
         case .list(let elems, _):
-            let vals = try elems.map { try eval($0, env: env) }
+            var vals: [Value] = []
+            for elem in elems {
+                vals.append(try await eval(elem, env: env))
+            }
             return .list(vals)
 
         // Attribute set
         case .attrSet(let attrSet, _):
-            return try evalAttrSet(attrSet, env: env)
+            return try await evalAttrSet(attrSet, env: env)
 
         // Select: expr.key1.key2 (with optional default)
         case .select(let baseExpr, let keys, let defaultExpr, _):
-            return try evalSelect(baseExpr, keys: keys, defaultExpr: defaultExpr, env: env)
+            return try await evalSelect(baseExpr, keys: keys, defaultExpr: defaultExpr, env: env)
 
         // Has-attr: expr ? key
         case .hasAttr(let baseExpr, let keys, _):
-            return try evalHasAttr(baseExpr, keys: keys, env: env)
+            return try await evalHasAttr(baseExpr, keys: keys, env: env)
 
         // Let...in
         case .letIn(let bindings, let body, _):
-            return try evalLet(bindings, body: body, env: env)
+            return try await evalLet(bindings, body: body, env: env)
 
         // With
         case .with(let nsExpr, let body, _):
-            return try evalWith(nsExpr, body: body, env: env)
+            return try await evalWith(nsExpr, body: body, env: env)
 
         // If/then/else
         case .ifThenElse(let cond, let thenExpr, let elseExpr, _):
-            let condVal = try eval(cond, env: env)
+            let condVal = try await eval(cond, env: env)
             guard case .bool(let b) = condVal else {
                 throw EvalError(message: "if condition must be a boolean, got \(condVal)")
             }
-            return try eval(b ? thenExpr : elseExpr, env: env)
+            return try await eval(b ? thenExpr : elseExpr, env: env)
 
         // Assert
         case .assert(let cond, let body, _):
-            let condVal = try eval(cond, env: env)
+            let condVal = try await eval(cond, env: env)
             guard case .bool(true) = condVal else {
                 throw EvalError(message: "assertion failed")
             }
-            return try eval(body, env: env)
+            return try await eval(body, env: env)
 
         // Lambda
         case .lambda(let param, let body, _):
@@ -293,18 +341,18 @@ public struct Evaluator: Sendable {
 
         // Application
         case .apply(let fnExpr, let argExpr, _):
-            return try evalApply(fnExpr, argExpr: argExpr, env: env)
+            return try await evalApply(fnExpr, argExpr: argExpr, env: env)
 
         // Unary operators
         case .unaryNot(let operand, _):
-            let val = try eval(operand, env: env)
+            let val = try await eval(operand, env: env)
             guard case .bool(let b) = val else {
                 throw EvalError(message: "! operator requires a boolean, got \(val)")
             }
             return .bool(!b)
 
         case .unaryNeg(let operand, _):
-            let val = try eval(operand, env: env)
+            let val = try await eval(operand, env: env)
             switch val {
             case .int(let n): return .int(-n)
             case .float(let f): return .float(-f)
@@ -313,20 +361,33 @@ public struct Evaluator: Sendable {
 
         // Binary operators
         case .binary(let op, let lhs, let rhs, _):
-            return try evalBinary(op, lhs: lhs, rhs: rhs, env: env)
+            return try await evalBinary(op, lhs: lhs, rhs: rhs, env: env)
         }
+    }
+
+    private func lookupAsync(_ name: String, in env: Env) async throws -> Value? {
+        if let v = env.bindings[name] { return v }
+        if let attrEnv = env as? AttrSetEnv {
+            if attrEnv.attrSet.has(name) {
+                return try await attrEnv.attrSet.force(name, evaluator: self)
+            }
+        }
+        if let p = env.parent {
+            return try await lookupAsync(name, in: p)
+        }
+        return nil
     }
 
     // MARK: - String evaluation
 
-    private func evalString(_ strExpr: StringExpr, env: Env) throws -> Value {
+    private func evalString(_ strExpr: StringExpr, env: Env) async throws -> Value {
         var result = ""
         for segment in strExpr.segments {
             switch segment {
             case .text(let t):
                 result += t
             case .interp(let expr):
-                let val = try eval(expr, env: env)
+                let val = try await eval(expr, env: env)
                 result += try coerceToString(val)
             }
         }
@@ -349,7 +410,7 @@ public struct Evaluator: Sendable {
 
     // MARK: - Attribute set evaluation
 
-    private func evalAttrSet(_ attrSet: AttrSet, env: Env) throws -> Value {
+    private func evalAttrSet(_ attrSet: AttrSet, env: Env) async throws -> Value {
         let result = AttrSetVal()
 
         if attrSet.isRec {
@@ -377,7 +438,7 @@ public struct Evaluator: Sendable {
 
             // Now set actual thunks using recEnv
             for binding in attrSet.bindings {
-                try setBinding(result, path: binding.path, value: binding.value, env: recEnv)
+                try await setBinding(result, path: binding.path, value: binding.value, env: recEnv)
             }
 
             // Patch recEnv bindings to point to the attrset fields
@@ -385,12 +446,12 @@ public struct Evaluator: Sendable {
             let attrSetEnv = AttrSetEnv(attrSet: result, evaluator: self, parent: env)
             // Re-set thunks with the proper env
             for binding in attrSet.bindings {
-                try setBinding(result, path: binding.path, value: binding.value, env: attrSetEnv)
+                try await setBinding(result, path: binding.path, value: binding.value, env: attrSetEnv)
             }
 
             // Handle inherits
             for inherit in attrSet.inherits {
-                try evalInherit(inherit, into: result, env: attrSetEnv)
+                try await evalInherit(inherit, into: result, env: attrSetEnv)
             }
 
             return resultVal
@@ -398,17 +459,17 @@ public struct Evaluator: Sendable {
         } else {
             // Non-recursive: thunks close over current env
             for binding in attrSet.bindings {
-                try setBinding(result, path: binding.path, value: binding.value, env: env)
+                try await setBinding(result, path: binding.path, value: binding.value, env: env)
             }
             for inherit in attrSet.inherits {
-                try evalInherit(inherit, into: result, env: env)
+                try await evalInherit(inherit, into: result, env: env)
             }
             return .attrSet(result)
         }
     }
 
     /// Set a binding in an attr set, handling nested paths like `a.b.c = val`.
-    private func setBinding(_ attrSet: AttrSetVal, path: [AttrKey], value: Expr, env: Env) throws {
+    private func setBinding(_ attrSet: AttrSetVal, path: [AttrKey], value: Expr, env: Env) async throws {
         guard let first = path.first else { return }
 
         let key = try attrKeyToString(first)
@@ -420,7 +481,7 @@ public struct Evaluator: Sendable {
             let nested: AttrSetVal
             if attrSet.has(key) {
                 // If it already exists, it must be an attrset to allow nesting.
-                let existing = try attrSet.force(key, evaluator: self)
+                let existing = try await attrSet.force(key, evaluator: self)
                 guard case .attrSet(let existingSet) = existing else {
                     throw EvalError(message: "attribute '\(key)' already defined and is not an attribute set")
                 }
@@ -430,7 +491,7 @@ public struct Evaluator: Sendable {
                 attrSet.set(key, value: .attrSet(nested))
             }
             let remaining = Array(path.dropFirst())
-            try setBinding(nested, path: remaining, value: value, env: env)
+            try await setBinding(nested, path: remaining, value: value, env: env)
         }
     }
 
@@ -441,23 +502,23 @@ public struct Evaluator: Sendable {
         }
     }
 
-    private func evalInherit(_ inherit: InheritClause, into attrSet: AttrSetVal, env: Env) throws {
+    private func evalInherit(_ inherit: InheritClause, into attrSet: AttrSetVal, env: Env) async throws {
         if let fromExpr = inherit.from {
             // inherit (expr) a b c; — look up attrs from the evaluated expr
-            let fromVal = try eval(fromExpr, env: env)
+            let fromVal = try await eval(fromExpr, env: env)
             guard case .attrSet(let fromSet) = fromVal else {
                 throw EvalError(message: "inherit source must be an attribute set")
             }
             for attr in inherit.attrs {
                 let name = try attrKeyToString(attr)
-                let val = try fromSet.force(name, evaluator: self)
+                let val = try await fromSet.force(name, evaluator: self)
                 attrSet.set(name, value: val)
             }
         } else {
             // inherit a b c; — look up from env
             for attr in inherit.attrs {
                 let name = try attrKeyToString(attr)
-                guard let val = env.lookup(name) else {
+                guard let val = (try await lookupAsync(name, in: env)) else {
                     throw EvalError(message: "undefined variable '\(name)' in inherit")
                 }
                 attrSet.set(name, value: val)
@@ -467,24 +528,24 @@ public struct Evaluator: Sendable {
 
     // MARK: - Select
 
-    private func evalSelect(_ baseExpr: Expr, keys: [AttrKey], defaultExpr: Expr?, env: Env) throws -> Value {
-        var current = try eval(baseExpr, env: env)
+    private func evalSelect(_ baseExpr: Expr, keys: [AttrKey], defaultExpr: Expr?, env: Env) async throws -> Value {
+        var current = try await eval(baseExpr, env: env)
 
         for key in keys {
             let keyStr = try attrKeyToString(key)
             guard case .attrSet(let attrSetVal) = current else {
                 if let def = defaultExpr {
-                    return try eval(def, env: env)
+                    return try await eval(def, env: env)
                 }
                 throw EvalError(message: "cannot select from non-attribute-set value")
             }
             if !attrSetVal.has(keyStr) {
                 if let def = defaultExpr {
-                    return try eval(def, env: env)
+                    return try await eval(def, env: env)
                 }
                 throw EvalError(message: "attribute '\(keyStr)' not found")
             }
-            current = try attrSetVal.force(keyStr, evaluator: self)
+            current = try await attrSetVal.force(keyStr, evaluator: self)
         }
 
         return current
@@ -492,8 +553,8 @@ public struct Evaluator: Sendable {
 
     // MARK: - Has-attr
 
-    private func evalHasAttr(_ baseExpr: Expr, keys: [AttrKey], env: Env) throws -> Value {
-        var current = try eval(baseExpr, env: env)
+    private func evalHasAttr(_ baseExpr: Expr, keys: [AttrKey], env: Env) async throws -> Value {
+        var current = try await eval(baseExpr, env: env)
 
         for key in keys {
             let keyStr = try attrKeyToString(key)
@@ -504,9 +565,7 @@ public struct Evaluator: Sendable {
                 return .bool(false)
             }
             // Force to get deeper for nested checks
-            if keys.last.map({ try? attrKeyToString($0) }) != keyStr {
-                current = (try? attrSetVal.force(keyStr, evaluator: self)) ?? .null
-            }
+            current = try await attrSetVal.force(keyStr, evaluator: self)
         }
 
         return .bool(true)
@@ -514,44 +573,44 @@ public struct Evaluator: Sendable {
 
     // MARK: - Let
 
-    private func evalLet(_ bindings: [Binding], body: Expr, env: Env) throws -> Value {
+    private func evalLet(_ bindings: [Binding], body: Expr, env: Env) async throws -> Value {
         // Let bindings are mutually recursive (like rec attrsets).
         let letSet = AttrSetVal()
         let letEnv = AttrSetEnv(attrSet: letSet, evaluator: self, parent: env)
 
         for binding in bindings {
-            try setBinding(letSet, path: binding.path, value: binding.value, env: letEnv)
+            try await setBinding(letSet, path: binding.path, value: binding.value, env: letEnv)
         }
 
-        return try eval(body, env: letEnv)
+        return try await eval(body, env: letEnv)
     }
 
     // MARK: - With
 
-    private func evalWith(_ nsExpr: Expr, body: Expr, env: Env) throws -> Value {
-        let nsVal = try eval(nsExpr, env: env)
+    private func evalWith(_ nsExpr: Expr, body: Expr, env: Env) async throws -> Value {
+        let nsVal = try await eval(nsExpr, env: env)
         guard case .attrSet(let attrSetVal) = nsVal else {
             throw EvalError(message: "with expression requires an attribute set, got \(nsVal)")
         }
 
         // Create env where lookups also check the attrset
         let withEnv = AttrSetEnv(attrSet: attrSetVal, evaluator: self, parent: env)
-        return try eval(body, env: withEnv)
+        return try await eval(body, env: withEnv)
     }
 
     // MARK: - Apply
 
-    private func evalApply(_ fnExpr: Expr, argExpr: Expr, env: Env) throws -> Value {
-        let fnVal = try eval(fnExpr, env: env)
+    private func evalApply(_ fnExpr: Expr, argExpr: Expr, env: Env) async throws -> Value {
+        let fnVal = try await eval(fnExpr, env: env)
 
         switch fnVal {
         case .closure(let closure):
-            let argVal = try eval(argExpr, env: env)
-            return try applyClosure(closure, arg: argVal)
+            let argVal = try await eval(argExpr, env: env)
+            return try await applyClosure(closure, arg: argVal)
 
         case .builtin(_, let fn):
-            let argVal = try eval(argExpr, env: env)
-            return try fn(argVal)
+            let argVal = try await eval(argExpr, env: env)
+            return try await fn(argVal)
 
         default:
             throw EvalError(message: "attempt to call a non-function value: \(fnVal)")
@@ -559,18 +618,18 @@ public struct Evaluator: Sendable {
     }
 
     /// Apply any function value (closure or builtin) to an argument.
-    public func applyFunction(_ fn: Value, arg: Value) throws -> Value {
+    public func applyFunction(_ fn: Value, arg: Value) async throws -> Value {
         switch fn {
         case .closure(let closure):
-            return try applyClosure(closure, arg: arg)
+            return try await applyClosure(closure, arg: arg)
         case .builtin(_, let bfn):
-            return try bfn(arg)
+            return try await bfn(arg)
         default:
             throw EvalError(message: "attempt to call a non-function value: \(fn)")
         }
     }
 
-    public func applyClosure(_ closure: ClosureVal, arg: Value) throws -> Value {
+    public func applyClosure(_ closure: ClosureVal, arg: Value) async throws -> Value {
         let bodyEnv: Env
 
         switch closure.param {
@@ -586,11 +645,11 @@ public struct Evaluator: Sendable {
 
             for field in pattern.fields {
                 if argSet.has(field.name) {
-                    newBindings[field.name] = try argSet.force(field.name, evaluator: self)
+                    newBindings[field.name] = try await argSet.force(field.name, evaluator: self)
                 } else if let defaultExpr = field.defaultValue {
                     // Evaluate default in the closure's env extended with bindings so far
                     let defEnv = closure.env.extend(newBindings)
-                    newBindings[field.name] = try eval(defaultExpr, env: defEnv)
+                    newBindings[field.name] = try await eval(defaultExpr, env: defEnv)
                 } else {
                     throw EvalError(message: "missing required attribute '\(field.name)' in function argument")
                 }
@@ -599,7 +658,8 @@ public struct Evaluator: Sendable {
             // Check for unexpected attributes if no ellipsis
             if !pattern.hasEllipsis {
                 let expected = Set(pattern.fields.map(\.name))
-                for key in argSet.keys {
+                let allKeys = argSet.keys
+                for key in allKeys {
                     if !expected.contains(key) {
                         throw EvalError(message: "unexpected attribute '\(key)' in function argument")
                     }
@@ -614,45 +674,45 @@ public struct Evaluator: Sendable {
             bodyEnv = closure.env.extend(newBindings)
         }
 
-        return try eval(closure.body, env: bodyEnv)
+        return try await eval(closure.body, env: bodyEnv)
     }
 
     // MARK: - Binary operators
 
-    private func evalBinary(_ op: BinaryOp, lhs: Expr, rhs: Expr, env: Env) throws -> Value {
+    private func evalBinary(_ op: BinaryOp, lhs: Expr, rhs: Expr, env: Env) async throws -> Value {
         // Short-circuit for logical operators
         switch op {
         case .and:
-            let leftVal = try eval(lhs, env: env)
+            let leftVal = try await eval(lhs, env: env)
             guard case .bool(let lb) = leftVal else {
                 throw EvalError(message: "&& requires booleans")
             }
             if !lb { return .bool(false) }
-            let rightVal = try eval(rhs, env: env)
+            let rightVal = try await eval(rhs, env: env)
             guard case .bool(let rb) = rightVal else {
                 throw EvalError(message: "&& requires booleans")
             }
             return .bool(rb)
 
         case .or:
-            let leftVal = try eval(lhs, env: env)
+            let leftVal = try await eval(lhs, env: env)
             guard case .bool(let lb) = leftVal else {
                 throw EvalError(message: "|| requires booleans")
             }
             if lb { return .bool(true) }
-            let rightVal = try eval(rhs, env: env)
+            let rightVal = try await eval(rhs, env: env)
             guard case .bool(let rb) = rightVal else {
                 throw EvalError(message: "|| requires booleans")
             }
             return .bool(rb)
 
         case .impl:
-            let leftVal = try eval(lhs, env: env)
+            let leftVal = try await eval(lhs, env: env)
             guard case .bool(let lb) = leftVal else {
                 throw EvalError(message: "-> requires booleans")
             }
             if !lb { return .bool(true) }
-            let rightVal = try eval(rhs, env: env)
+            let rightVal = try await eval(rhs, env: env)
             guard case .bool(let rb) = rightVal else {
                 throw EvalError(message: "-> requires booleans")
             }
@@ -662,8 +722,8 @@ public struct Evaluator: Sendable {
             break
         }
 
-        let leftVal = try eval(lhs, env: env)
-        let rightVal = try eval(rhs, env: env)
+        let leftVal = try await eval(lhs, env: env)
+        let rightVal = try await eval(rhs, env: env)
 
         switch op {
         // Arithmetic
@@ -802,9 +862,7 @@ final class AttrSetEnv: Env, @unchecked Sendable {
     }
 
     override func lookup(_ name: String) -> Value? {
-        if attrSet.has(name) {
-            return try? attrSet.force(name, evaluator: evaluator)
-        }
+        // Fallback for sync lookups
         return parent?.lookup(name)
     }
 }

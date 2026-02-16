@@ -43,7 +43,11 @@ public struct Builtins: Sendable {
         }
         set(b, "attrValues") { v in
             guard case .attrSet(let s) = v else { throw EvalError(message: "builtins.attrValues: expected set") }
-            return .list(try s.keys.sorted().map { try s.force($0, evaluator: evaluator) })
+            var results: [Value] = []
+            for key in s.keys.sorted() {
+                results.append(try await s.force(key, evaluator: evaluator))
+            }
+            return .list(results)
         }
         set(b, "hasAttr") { v in
             guard case .string(let name) = v else { throw EvalError(message: "builtins.hasAttr: expected string") }
@@ -56,7 +60,7 @@ public struct Builtins: Sendable {
             guard case .string(let name) = v else { throw EvalError(message: "builtins.getAttr: expected string") }
             return .builtin("getAttr") { v2 in
                 guard case .attrSet(let s) = v2 else { throw EvalError(message: "builtins.getAttr: expected set") }
-                return try s.force(name, evaluator: evaluator)
+                return try await s.force(name, evaluator: evaluator)
             }
         }
         set(b, "removeAttrs") { v in
@@ -69,7 +73,7 @@ public struct Builtins: Sendable {
                 })
                 let result = AttrSetVal()
                 for key in s.keys where !toRemove.contains(key) {
-                    result.set(key, value: try s.force(key, evaluator: evaluator))
+                    result.set(key, value: try await s.force(key, evaluator: evaluator))
                 }
                 return .attrSet(result)
             }
@@ -80,7 +84,7 @@ public struct Builtins: Sendable {
                 guard case .attrSet(let s2) = v2 else { throw EvalError(message: "builtins.intersectAttrs: expected set") }
                 let result = AttrSetVal()
                 for key in s1.keys {
-                    if s2.has(key) { result.set(key, value: try s2.force(key, evaluator: evaluator)) }
+                    if s2.has(key) { result.set(key, value: try await s2.force(key, evaluator: evaluator)) }
                 }
                 return .attrSet(result)
             }
@@ -90,9 +94,9 @@ public struct Builtins: Sendable {
             let result = AttrSetVal()
             for item in items {
                 guard case .attrSet(let s) = item else { throw EvalError(message: "builtins.listToAttrs: list items must be sets") }
-                let name = try s.force("name", evaluator: evaluator)
+                let name = try await s.force("name", evaluator: evaluator)
                 guard case .string(let n) = name else { throw EvalError(message: "builtins.listToAttrs: name must be string") }
-                let value = try s.force("value", evaluator: evaluator)
+                let value = try await s.force("value", evaluator: evaluator)
                 result.set(n, value: value)
             }
             return .attrSet(result)
@@ -103,9 +107,9 @@ public struct Builtins: Sendable {
                 guard case .attrSet(let s) = v2 else { throw EvalError(message: "builtins.mapAttrs: expected set") }
                 let result = AttrSetVal()
                 for key in s.keys {
-                    let val = try s.force(key, evaluator: evaluator)
-                    let mapped = try Builtins.applyFn(fn, arg: .string(key), evaluator: evaluator)
-                    let mapped2 = try Builtins.applyFn(mapped, arg: val, evaluator: evaluator)
+                    let val = try await s.force(key, evaluator: evaluator)
+                    let mapped = try await Builtins.applyFn(fn, arg: .string(key), evaluator: evaluator)
+                    let mapped2 = try await Builtins.applyFn(mapped, arg: val, evaluator: evaluator)
                     result.set(key, value: mapped2)
                 }
                 return .attrSet(result)
@@ -140,17 +144,23 @@ public struct Builtins: Sendable {
         set(b, "map") { fn in
             return .builtin("map") { v2 in
                 guard case .list(let l) = v2 else { throw EvalError(message: "builtins.map: expected list") }
-                return .list(try l.map { try Builtins.applyFn(fn, arg: $0, evaluator: evaluator) })
+                var results: [Value] = []
+                for item in l {
+                    results.append(try await Builtins.applyFn(fn, arg: item, evaluator: evaluator))
+                }
+                return .list(results)
             }
         }
         set(b, "filter") { fn in
             return .builtin("filter") { v2 in
                 guard case .list(let l) = v2 else { throw EvalError(message: "builtins.filter: expected list") }
-                return .list(try l.filter {
-                    let r = try Builtins.applyFn(fn, arg: $0, evaluator: evaluator)
+                var results: [Value] = []
+                for item in l {
+                    let r = try await Builtins.applyFn(fn, arg: item, evaluator: evaluator)
                     guard case .bool(let b) = r else { throw EvalError(message: "builtins.filter: predicate must return bool") }
-                    return b
-                })
+                    if b { results.append(item) }
+                }
+                return .list(results)
             }
         }
         set(b, "foldl'") { fn in
@@ -159,8 +169,8 @@ public struct Builtins: Sendable {
                     guard case .list(let l) = v3 else { throw EvalError(message: "builtins.foldl': expected list") }
                     var acc = init_
                     for elem in l {
-                        let partial = try Builtins.applyFn(fn, arg: acc, evaluator: evaluator)
-                        acc = try Builtins.applyFn(partial, arg: elem, evaluator: evaluator)
+                        let partial = try await Builtins.applyFn(fn, arg: acc, evaluator: evaluator)
+                        acc = try await Builtins.applyFn(partial, arg: elem, evaluator: evaluator)
                     }
                     return acc
                 }
@@ -185,9 +195,11 @@ public struct Builtins: Sendable {
             return .builtin("genList") { v2 in
                 guard case .int(let n) = v2 else { throw EvalError(message: "builtins.genList: expected int") }
                 guard n >= 0 else { throw EvalError(message: "builtins.genList: negative length") }
-                return .list(try (0..<n).map { i in
-                    try Builtins.applyFn(fn, arg: .int(i), evaluator: evaluator)
-                })
+                var results: [Value] = []
+                for i in 0..<n {
+                    results.append(try await Builtins.applyFn(fn, arg: .int(Int64(i)), evaluator: evaluator))
+                }
+                return .list(results)
             }
         }
         set(b, "concatMap") { fn in
@@ -195,7 +207,7 @@ public struct Builtins: Sendable {
                 guard case .list(let l) = v2 else { throw EvalError(message: "builtins.concatMap: expected list") }
                 var result: [Value] = []
                 for item in l {
-                    let mapped = try Builtins.applyFn(fn, arg: item, evaluator: evaluator)
+                    let mapped = try await Builtins.applyFn(fn, arg: item, evaluator: evaluator)
                     guard case .list(let ml) = mapped else { throw EvalError(message: "builtins.concatMap: function must return list") }
                     result.append(contentsOf: ml)
                 }
@@ -206,7 +218,7 @@ public struct Builtins: Sendable {
             return .builtin("any") { v2 in
                 guard case .list(let l) = v2 else { throw EvalError(message: "builtins.any: expected list") }
                 for item in l {
-                    let r = try Builtins.applyFn(fn, arg: item, evaluator: evaluator)
+                    let r = try await Builtins.applyFn(fn, arg: item, evaluator: evaluator)
                     if case .bool(true) = r { return .bool(true) }
                 }
                 return .bool(false)
@@ -216,7 +228,7 @@ public struct Builtins: Sendable {
             return .builtin("all") { v2 in
                 guard case .list(let l) = v2 else { throw EvalError(message: "builtins.all: expected list") }
                 for item in l {
-                    let r = try Builtins.applyFn(fn, arg: item, evaluator: evaluator)
+                    let r = try await Builtins.applyFn(fn, arg: item, evaluator: evaluator)
                     if case .bool(false) = r { return .bool(false) }
                 }
                 return .bool(true)
@@ -225,11 +237,19 @@ public struct Builtins: Sendable {
         set(b, "sort") { fn in
             return .builtin("sort") { v2 in
                 guard case .list(let l) = v2 else { throw EvalError(message: "builtins.sort: expected list") }
-                let sorted = try l.sorted { a, b in
-                    let partial = try Builtins.applyFn(fn, arg: a, evaluator: evaluator)
-                    let result = try Builtins.applyFn(partial, arg: b, evaluator: evaluator)
-                    guard case .bool(let lt) = result else { throw EvalError(message: "builtins.sort: comparator must return bool") }
-                    return lt
+                // Array.sorted(by:) is not async, so we use a custom sort or just a simple one for now.
+                // For simplicity, we'll collect the results of comparisons if needed, but that's complex.
+                // Let's do a simple bubble sort or similar to keep it async-safe easily.
+                var sorted = l
+                for i in 0..<sorted.count {
+                    for j in i+1..<sorted.count {
+                        let partial = try await Builtins.applyFn(fn, arg: sorted[j], evaluator: evaluator)
+                        let result = try await Builtins.applyFn(partial, arg: sorted[i], evaluator: evaluator)
+                        guard case .bool(let lt) = result else { throw EvalError(message: "builtins.sort: comparator must return bool") }
+                        if lt {
+                            sorted.swapAt(i, j)
+                        }
+                    }
                 }
                 return .list(sorted)
             }
@@ -330,7 +350,7 @@ public struct Builtins: Sendable {
         }}
 
         // --- JSON ---
-        set(b, "toJSON") { v in return .string(try Builtins.valueToJSON(v, evaluator: evaluator)) }
+        set(b, "toJSON") { v in return .string(try await Builtins.valueToJSON(v, evaluator: evaluator)) }
         set(b, "fromJSON") { v in
             guard case .string(let s) = v else { throw EvalError(message: "builtins.fromJSON: expected string") }
             return try Builtins.jsonToValue(s)
@@ -369,7 +389,7 @@ public struct Builtins: Sendable {
                 resolvedPath = path
             }
             let env = Builtins.baseEnv(evaluator: evaluator)
-            return try evaluator.evalFile(resolvedPath, env: env)
+            return try await evaluator.evalFile(resolvedPath, env: env)
         }
 
         // --- Error / debug ---
@@ -424,7 +444,11 @@ public struct Builtins: Sendable {
         top["null"] = .null
         top["map"] = .builtin("map") { fn in .builtin("map") { v2 in
             guard case .list(let l) = v2 else { throw EvalError(message: "map: expected list") }
-            return .list(try l.map { try Builtins.applyFn(fn, arg: $0, evaluator: evaluator) })
+            var results: [Value] = []
+            for item in l {
+                results.append(try await Builtins.applyFn(fn, arg: item, evaluator: evaluator))
+            }
+            return .list(results)
         }}
         top["throw"] = .builtin("throw") { v in
             guard case .string(let m) = v else { throw EvalError(message: "throw: expected string") }
@@ -446,7 +470,7 @@ public struct Builtins: Sendable {
                 resolvedPath = path
             }
             let env = Builtins.baseEnv(evaluator: evaluator)
-            return try evaluator.evalFile(resolvedPath, env: env)
+            return try await evaluator.evalFile(resolvedPath, env: env)
         }
         top["baseNameOf"] = .builtin("baseNameOf") { v in
             guard case .string(let s) = v else { throw EvalError(message: "baseNameOf: expected string") }
@@ -468,7 +492,7 @@ public struct Builtins: Sendable {
                 })
                 let result = AttrSetVal()
                 for key in s.keys where !toRemove.contains(key) {
-                    result.set(key, value: try s.force(key, evaluator: evaluator))
+                    result.set(key, value: try await s.force(key, evaluator: evaluator))
                 }
                 return .attrSet(result)
             }
@@ -482,15 +506,15 @@ public struct Builtins: Sendable {
 
     // MARK: - Helpers
 
-    private static func set(_ s: AttrSetVal, _ name: String, fn: @escaping @Sendable (Value) throws -> Value) {
+    private static func set(_ s: AttrSetVal, _ name: String, fn: @escaping @Sendable (Value) async throws -> Value) {
         s.set(name, value: .builtin(name, fn))
     }
 
     /// Apply a Value (closure or builtin) to an argument.
-    public static func applyFn(_ fn: Value, arg: Value, evaluator: Evaluator) throws -> Value {
+    public static func applyFn(_ fn: Value, arg: Value, evaluator: Evaluator) async throws -> Value {
         switch fn {
-        case .closure(let c): return try evaluator.applyClosure(c, arg: arg)
-        case .builtin(_, let f): return try f(arg)
+        case .closure(let c): return try await evaluator.applyClosure(c, arg: arg)
+        case .builtin(_, let f): return try await f(arg)
         default: throw EvalError(message: "expected function, got \(fn)")
         }
     }
@@ -534,23 +558,28 @@ public struct Builtins: Sendable {
 
     // MARK: - JSON
 
-    static func valueToJSON(_ v: Value, evaluator: Evaluator) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: try valueToJSONObj(v, evaluator: evaluator), options: [.sortedKeys, .fragmentsAllowed])
+    static func valueToJSON(_ v: Value, evaluator: Evaluator) async throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: try await valueToJSONObj(v, evaluator: evaluator), options: [.sortedKeys, .fragmentsAllowed])
         return String(data: data, encoding: .utf8) ?? "null"
     }
 
-    static func valueToJSONObj(_ v: Value, evaluator: Evaluator) throws -> Any {
+    static func valueToJSONObj(_ v: Value, evaluator: Evaluator) async throws -> Any {
         switch v {
         case .int(let n): return NSNumber(value: n)
         case .float(let f): return NSNumber(value: f)
         case .bool(let b): return NSNumber(value: b)
         case .null: return NSNull()
         case .string(let s): return s
-        case .list(let l): return try l.map { try valueToJSONObj($0, evaluator: evaluator) }
+        case .list(let l):
+            var results: [Any] = []
+            for item in l {
+                results.append(try await valueToJSONObj(item, evaluator: evaluator))
+            }
+            return results
         case .attrSet(let s):
             var dict: [String: Any] = [:]
             for key in s.keys.sorted() {
-                dict[key] = try valueToJSONObj(s.force(key, evaluator: evaluator), evaluator: evaluator)
+                dict[key] = try await valueToJSONObj(s.force(key, evaluator: evaluator), evaluator: evaluator)
             }
             return dict
         case .path(let p): return p
