@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:swift-os}",
+            "name": "Debug kernel",
+            "target": "kernel",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug kernel"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:swift-os}",
+            "name": "Release kernel",
+            "target": "kernel",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release kernel"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:swift-os}",
+            "name": "Debug InitialProcess",
+            "target": "InitialProcess",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug InitialProcess"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:swift-os}",
+            "name": "Release InitialProcess",
+            "target": "InitialProcess",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release InitialProcess"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:swift-os}",
+            "name": "Debug Kernel",
+            "target": "Kernel",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Kernel"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:swift-os}",
+            "name": "Release Kernel",
+            "target": "Kernel",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Kernel"
+        }
+    ]
+}
