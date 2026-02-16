@@ -1,0 +1,27 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1771215498,
+        "narHash": "sha256-UB+ANpV/EhBHf7+Gk+IRYPcKKYFcToRP1MR+rpw7994=",
+        "owner": "tinted-software",
+        "repo": "nixpkgs",
+        "rev": "b0838b0517935f9b7d61f9262847eee6bd354978",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tinted-software",
+        "ref": "theoparis/swift",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

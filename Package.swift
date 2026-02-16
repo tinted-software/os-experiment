@@ -16,7 +16,10 @@ let package = Package(
                 .unsafeFlags([
                     "-wmo",
                     "-Xfrontend", "-disable-stack-protector",
-                    "-Xfrontend", "-no-allocations",
+                    "-Xfrontend", "-disable-stack-protector",
+                    // TODO: add kasan
+                    // "-sanitize=address",
+                    // "-Xc", "-fno-sanitize-address-globals",
                 ]),
             ]
         ),
@@ -31,7 +34,9 @@ let package = Package(
             path: "Sources/CSupport",
             publicHeadersPath: "include",
             cSettings: [
-                .unsafeFlags(["-ffreestanding"])
+                .unsafeFlags([
+                    "-ffreestanding"
+                ])
             ]
         ),
         .target(
