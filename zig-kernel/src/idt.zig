@@ -64,53 +64,14 @@ pub fn init() void {
         .base = @intFromPtr(&idt),
     };
 
+    main.kprint("IDT Base: 0x");
+    main.kprintHex(idtr.base);
+    main.kprint(" Limit: 0x");
+    main.kprintHex(idtr.limit);
+    main.kprint("\n");
+
     load_idt(&idtr);
     main.kprint("IDT loaded\n");
-}
-
-pub export fn exception_handler(
-    vector: u64,
-    error_code: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
-) void {
-    main.kprint("\n=== Zig EXCEPTION ===\n");
-    main.kprint("Vector: ");
-    main.kprintHex(vector);
-    main.kprint("\n");
-    main.kprint("Error:  ");
-    main.kprintHex(error_code);
-    main.kprint("\n");
-    main.kprint("RIP:    ");
-    main.kprintHex(rip);
-    main.kprint("\n");
-    main.kprint("CS:     ");
-    main.kprintHex(cs);
-    main.kprint("\n");
-    main.kprint("RFLAGS: ");
-    main.kprintHex(rflags);
-    main.kprint("\n");
-    main.kprint("RSP:    ");
-    main.kprintHex(rsp);
-    main.kprint("\n");
-    main.kprint("SS:     ");
-    main.kprintHex(ss);
-    main.kprint("\n");
-
-    var cr2: u64 = undefined;
-    asm volatile ("mov %%cr2, %[cr2]"
-        : [cr2] "=r" (cr2),
-    );
-    main.kprint("CR2:    ");
-    main.kprintHex(cr2);
-    main.kprint("\n");
-
-    while (true) {
-        asm volatile ("hlt");
-    }
 }
 
 extern fn isr_stub_0() void;

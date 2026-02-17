@@ -16,8 +16,6 @@ pub const Multiboot2TagModule = extern struct {
     string: u8, // Start of null-terminated string
 };
 
-// ... MB2 tags ...
-
 // Multiboot 1
 pub const MultibootInfo = extern struct {
     flags: u32,

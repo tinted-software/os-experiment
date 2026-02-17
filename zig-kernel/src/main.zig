@@ -24,6 +24,10 @@ const macho = @import("macho.zig");
 pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
     serial_init();
     kprint("Zig OS Kernel Booting...\n");
+
+    gdt.init(@intFromPtr(&stack_top));
+    idt.init();
+
     // ... magic parsing ...
     if (magic != 0x36D76289 and magic != 0x2BADB002) {
         kprint("Error: Invalid Multiboot magic: 0x");
@@ -81,8 +85,21 @@ pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
                 kprintHex(res.entry_point);
                 kprint("\n");
 
+                enable_features();
+
                 // Setup stack for dyld
-                const user_stack_top: u64 = 0x70000000;
+                // Use lower addresses to be safe within 1GB RAM if needed
+                // Text: 0x10000000 (256MB) is fine
+                // Stack: 0x20000000 (512MB) seems safer than 0x70000000 (1.79GB)
+                // BUT boot.S maps 8GB! So 0x70000000 is virtual.
+                // Does physical RAM back it? -m 1G means only 1GB RAM.
+                // The identity map maps VIRTUAL 0..8GB to PHYSICAL 0..8GB.
+                // So 0x70000000 maps to 0x70000000 physical.
+                // With 1GB RAM, 0x70000000 is OUT OF BOUNDS.
+                // accessing it will cause a fault or read/write ignore.
+
+                const user_stack_top: u64 = 0x20000000; // 512MB - safely inside 1GB
+
                 // Zero out the stack page (4KB)
                 const stack_page: [*]u8 = @ptrFromInt(user_stack_top - 0x1000);
                 _ = memset(stack_page, 0, 0x1000);
@@ -250,20 +267,138 @@ fn setupDyldStack(exec_path: []const u8, text_base: u64, entry_point: u64, user_
     return @intFromPtr(sp_base);
 }
 
-fn jump_to_user(entry: u64, sp: u64) noreturn {
-    // We are in kernel mode (Ring 0). To jump to "user" mode (Ring 3) or just run this code in Ring 0 for now?
-    // SwiftOS `jump_to_user` likely uses `iretq` or `sysret`.
-    // For now, since we haven't set up GDT for user mode fully (TSS etc properly), let's just jump to it in kernel mode?
-    // But `dyld` might expect to be in user mode.
-    // However, simplest step is `jmp` or `call`.
-    // But stack pointer must be switched.
+const MSR_STAR = 0xC0000081;
+const MSR_LSTAR = 0xC0000082;
+const MSR_FMASK = 0xC0000084;
+const MSR_EFER = 0xC0000080;
 
-    // Switch stack and jump
-    asm volatile (
-        \\ mov %[sp], %%rsp
-        \\ jmp *%[entry]
+fn enable_features() void {
+    // Enable FSGSBASE (CR4 bit 16)
+    var cr4: u64 = undefined;
+    asm volatile ("mov %%cr4, %[cr4]"
+        : [cr4] "=r" (cr4),
+    );
+    cr4 |= (1 << 16);
+    asm volatile ("mov %[cr4], %%cr4"
         :
-        : [sp] "r" (sp),
+        : [cr4] "r" (cr4),
+    );
+
+    // Enable SCE (EFER bit 0)
+    var efer_lo: u32 = undefined;
+    var efer_hi: u32 = undefined;
+    asm volatile ("rdmsr"
+        : [lo] "={eax}" (efer_lo),
+          [hi] "={edx}" (efer_hi),
+        : [msr] "{ecx}" (MSR_EFER),
+    );
+    efer_lo |= 1;
+    asm volatile ("wrmsr"
+        :
+        : [lo] "{eax}" (efer_lo),
+          [hi] "{edx}" (efer_hi),
+    );
+
+    setup_syscalls();
+}
+
+fn setup_syscalls() void {
+    // STAR: Syscall/Sysret CS/SS configuration
+    // [63:48] Sysret CS (User CS - 16) -> 0x1B - 16 ?? No, sysret loads CS with (STAR[63:48] + 16) and SS with (STAR[63:48] + 8)
+    // Actually Linux uses: Kernel CS=0x8, User CS 32-bit=0x23??
+    // Standard x86_64:
+    //   Syscall: CS = STAR[47:32] & 0xFFFC, SS = STAR[47:32] + 8
+    //   Sysret:  CS = STAR[63:48] + 16,     SS = STAR[63:48] + 8
+    // GDT: Null(0), KCode(8), KData(16), UCode(24=0x18), UData(32=0x20)
+    // We want Syscall to load KCode(0x8). So STAR[47:32] = 0x8.
+    // We want Sysret to load UCode(0x18) and UData(0x20).
+    //   If STAR[63:48] = 0x8 (Kernel base), then CS=0x8+16=0x18 (UCode), SS=0x8+8=0x10 (KData? No).
+    //   Wait, Sysret sets SS = STAR[63:48] + 8. If we want SS=0x20 (UData), we need base 0x18?
+    //   Then CS = 0x18+16 = 0x28 (Invalid?).
+    //   Actually GDT layout is usually: KCode, KData, UData, UCode.
+    //   My GDT: 8=KCode, 16=KData, 24=UCode, 32=UData.
+    //   This is "UCode, UData" order.
+    //   Sysret: CS = Base+16, SS = Base+8.
+    //   If Base=0x10 (KData selector), then SS=0x18 (UCode??), CS=0x20 (UData??).
+    //   Inverted.
+    //   Common trick: Organize GDT as KCode, KData, UData, UCode (or compat).
+    //   Current GDT: 24(0x18)=UCode, 32(0x20)=UData.
+    //   If I use Base=0x10. SS=0x18 (UCode). CS=0x20 (UData). This is backwards for standard layout.
+    //   I should swap UCode and UData in GDT if I want standard SYSRET behavior?
+    //   Or I can live with it if I don't use SYSRET immediately?
+    //   But `dyld` might crash if I don't set it?
+    //   For now, just Setting STAR to something valid prevents #GP on `syscall`.
+
+    const k_cs = 0x08;
+    const u_cs_base = 0x10; // Try 0x10 (KData). Result: CS=0x20(UData), SS=0x18(UCode).
+    // If user CS is 0x1B (0x18|3) and SS is 0x23 (0x20|3).
+    // SYSRET loads CS selector with (Base+16)|3.
+
+    // Low 32: EIP (legacy setup, unused in long mode)
+    const star: u64 = (@as(u64, u_cs_base) << 48) | (@as(u64, k_cs) << 32);
+
+    write_msr(MSR_STAR, star);
+    write_msr(MSR_LSTAR, @intFromPtr(&syscall_handler_stub));
+    write_msr(MSR_FMASK, 0); // Don't mask flags for now
+}
+
+fn write_msr(msr: u32, val: u64) void {
+    const lo: u32 = @truncate(val);
+    const hi: u32 = @truncate(val >> 32);
+    asm volatile ("wrmsr"
+        :
+        : [lo] "{eax}" (lo),
+          [hi] "{edx}" (hi),
+          [msr] "{ecx}" (msr),
+    );
+}
+
+export fn syscall_handler_stub() callconv(.naked) void {
+    asm volatile (
+        \\ swapgs
+        \\ mov %rsp, %gs:8
+        \\ sti
+        \\ 1: hlt
+        \\ jmp 1b
+    );
+}
+
+fn jump_to_user(entry: u64, sp: u64) noreturn {
+    const user_cs: u64 = 0x1B; // 0x18 | 3
+    const user_ss: u64 = 0x23; // 0x20 | 3
+    const rflags: u64 = 0x202; // IF=1, bit 1=1
+
+    // Debug print
+    kprint("IRETQ to User Mode:\n");
+    kprint("  RIP: ");
+    kprintHex(entry);
+    kprint("\n");
+    kprint("  RSP: ");
+    kprintHex(sp);
+    kprint("\n");
+    kprint("  CS:  ");
+    kprintHex(user_cs);
+    kprint("\n");
+    kprint("  SS:  ");
+    kprintHex(user_ss);
+    kprint("\n");
+
+    asm volatile (
+        \\ mov %[ss], %%ds
+        \\ mov %[ss], %%es
+        \\ mov %[ss], %%fs
+        \\ mov %[ss], %%gs
+        \\ pushq %[ss]
+        \\ pushq %[sp]
+        \\ pushq %[rflags]
+        \\ pushq %[cs]
+        \\ pushq %[entry]
+        \\ iretq
+        :
+        : [ss] "r" (user_ss),
+          [sp] "r" (sp),
+          [rflags] "r" (rflags),
+          [cs] "r" (user_cs),
           [entry] "r" (entry),
     );
     while (true) {}
@@ -377,6 +512,12 @@ pub export fn exception_handler(vector: u64, err_code: u64, rip: u64, cs: u64, r
     kprintHex(rsp);
     kprint(" SS: ");
     kprintHex(ss);
+    var cr2: u64 = undefined;
+    asm volatile ("mov %%cr2, %[cr2]"
+        : [cr2] "=r" (cr2),
+    );
+    kprint("CR2:    ");
+    kprintHex(cr2);
     kprint("\n");
     while (true) asm volatile ("hlt");
 }

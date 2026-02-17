@@ -1,13 +1,31 @@
 const main = @import("main.zig");
 
-pub const TssEntry = extern struct {
+pub const TssEntry = packed struct {
     res0: u32 = 0,
-    rsp0: u64 = 0,
-    rsp1: u64 = 0,
-    rsp2: u64 = 0,
-    res1: u64 = 0,
-    ist: [7]u64 = [_]u64{0} ** 7,
-    res2: u64 = 0,
+    rsp0_lo: u32 = 0,
+    rsp0_hi: u32 = 0,
+    rsp1_lo: u32 = 0,
+    rsp1_hi: u32 = 0,
+    rsp2_lo: u32 = 0,
+    rsp2_hi: u32 = 0,
+    res1_lo: u32 = 0,
+    res1_hi: u32 = 0,
+    ist1_lo: u32 = 0,
+    ist1_hi: u32 = 0,
+    ist2_lo: u32 = 0,
+    ist2_hi: u32 = 0,
+    ist3_lo: u32 = 0,
+    ist3_hi: u32 = 0,
+    ist4_lo: u32 = 0,
+    ist4_hi: u32 = 0,
+    ist5_lo: u32 = 0,
+    ist5_hi: u32 = 0,
+    ist6_lo: u32 = 0,
+    ist6_hi: u32 = 0,
+    ist7_lo: u32 = 0,
+    ist7_hi: u32 = 0,
+    res2_lo: u32 = 0,
+    res2_hi: u32 = 0,
     res3: u16 = 0,
     iopb: u16 = 0,
 };
@@ -32,7 +50,8 @@ pub fn init(kstack: u64) void {
     main.kprintHex(kstack);
     main.kprint("\n");
 
-    tss.rsp0 = kstack;
+    tss.rsp0_lo = @truncate(kstack);
+    tss.rsp0_hi = @truncate(kstack >> 32);
     tss.iopb = @sizeOf(TssEntry);
 
     const base = @intFromPtr(&tss);
