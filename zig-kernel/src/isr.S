@@ -23,6 +23,12 @@ isr_common:
     jz 1f
     swapgs
 1:
+    push %rax
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    pop %rax
+    
     push %rdi
     push %rsi
     push %rdx
@@ -51,7 +57,7 @@ isr_common:
     /* We need a 7th argument (ss), which goes on the stack in x86_64 calling convention? */
     /* Actually, sysV AMD64 uses RDI, RSI, RDX, RCX, R8, R9 for first 6 args. */
     /* 7th arg goes on stack. */
-    push 112+8(%rsp) /* ss (offset shifted by push) */
+    push 112(%rsp) /* ss (offset relative to current rsp before push) */
     
     call exception_handler
     
@@ -93,7 +99,7 @@ ISR_NOERR 4
 ISR_NOERR 5
 ISR_NOERR 6
 ISR_NOERR 7
-ISR_NOERR 8
+ISR_ERR 8
 ISR_NOERR 9
 ISR_ERR 10
 ISR_ERR 11
@@ -112,3 +118,57 @@ irq_stub_generic:
     pushq $0
     pushq $255
     jmp isr_common
+
+.global syscall_handler_stub
+syscall_handler_stub:
+    swapgs
+    /* Save user stack pointer */
+    mov %rsp, syscall_user_rsp(%rip)
+    /* Load kernel stack */
+    mov $stack_top, %rsp
+    
+    push %rax
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    pop %rax
+
+    /* Save syscall return state */
+    push %rcx /* Old RIP */
+    push %r11 /* Old RFLAGS */
+    push %rbp
+    
+    /* Argument shuffling */
+    /* Syscall: RAX, RDI, RSI, RDX, R10, R8, R9 */
+    /* Dispatch: RDI, RSI, RDX, RCX, R8, R9, Stack */
+    
+    push %r9       /* Arg 6 -> Stack (7th arg) */
+    
+    mov %r8, %r9   /* Arg 5 -> Arg 6 reg */
+    mov %r10, %r8  /* Arg 4 -> Arg 5 reg */
+    mov %rdx, %rcx /* Arg 3 -> Arg 4 reg */
+    mov %rsi, %rdx /* Arg 2 -> Arg 3 reg */
+    mov %rdi, %rsi /* Arg 1 -> Arg 2 reg */
+    mov %rax, %rdi /* Nr    -> Arg 1 reg */
+    
+    call syscall_dispatch
+    
+    add $8, %rsp   /* Pop 7th arg */
+    
+    pop %rbp
+    pop %r11
+    pop %rcx
+    
+    /* Build iretq frame */
+    pushq $0x1B    /* SS */
+    pushq syscall_user_rsp(%rip) /* RSP */
+    pushq %r11     /* RFLAGS */
+    pushq $0x23    /* CS */
+    pushq %rcx     /* RIP */
+    
+    swapgs
+    iretq
+
+.section .bss
+.align 8
+syscall_user_rsp: .quad 0

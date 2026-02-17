@@ -40,7 +40,7 @@ pub fn init() void {
     setGate(5, @intFromPtr(&isr_stub_5), 0, 0x8E);
     setGate(6, @intFromPtr(&isr_stub_6), 0, 0x8E);
     setGate(7, @intFromPtr(&isr_stub_7), 0, 0x8E);
-    setGate(8, @intFromPtr(&isr_stub_8), 0, 0x8E);
+    setGate(8, @intFromPtr(&isr_stub_8), 1, 0x8E); // Use IST 1
     setGate(9, @intFromPtr(&isr_stub_9), 0, 0x8E);
     setGate(10, @intFromPtr(&isr_stub_10), 0, 0x8E);
     setGate(11, @intFromPtr(&isr_stub_11), 0, 0x8E);
@@ -72,6 +72,20 @@ pub fn init() void {
 
     load_idt(&idtr);
     main.kprint("IDT loaded\n");
+
+    // Disable PIC
+    const PIC1_DATA = 0x21;
+    const PIC2_DATA = 0xA1;
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+}
+
+fn outb(port: u16, val: u8) void {
+    asm volatile ("outb %[val], %[port]"
+        :
+        : [val] "{al}" (val),
+          [port] "{dx}" (port),
+    );
 }
 
 extern fn isr_stub_0() void;

@@ -60,7 +60,7 @@ _start:
 
     /* Zero all page tables */
     mov $p4_table, %edi
-    mov $(4096 + 4096 + 8*4096), %ecx   /* p4 + p3 + 8 x p2 tables */
+    mov $57344, %ecx   /* Zero everything up to stack_bottom */
     xor %eax, %eax
     rep stosb
 
@@ -69,7 +69,33 @@ _start:
     mov $p3_table, %eax
     or $7, %eax
     mov %eax, (%edi)
-    mov %eax, 2040(%edi)
+    
+    /* Map Comm Page at 0x7FFFFFE00000 */
+    /* P4[255] -> p3_comm */
+    mov $p3_comm, %eax
+    or $7, %eax
+    mov %eax, 2040(%edi) /* 255 * 8 = 2040 */
+
+    /* P3[511] -> p2_comm */
+    mov $p3_comm, %edi
+    mov $p2_comm, %eax
+    or $7, %eax
+    mov %eax, 4088(%edi) /* 511 * 8 = 4088 */
+
+    /* P2[511] -> p1_comm */
+    mov $p2_comm, %edi
+    mov $p1_comm, %eax
+    or $7, %eax
+    mov %eax, 4088(%edi) /* 511 * 8 = 4088 */
+
+    /* P1[0] -> comm_page */
+    mov $p1_comm, %edi
+    mov $comm_page, %eax
+    or $7, %eax
+    mov %eax, 0(%edi)    /* Index 0 */
+
+    /* P3[0] -> p2_table_base (recursive map?? No, just identity) */
+    /* Wait, original code: P3[0..7] -> p2 tables */
 
     /* P3[0..7] -> p2 tables (covers 0-8GB, 1GB each) */
     mov $p3_table, %edi
@@ -164,9 +190,21 @@ realm64:
 
 .section .bss
 .align 4096
+.global p4_table
 p4_table: .skip 4096
+.global comm_page
+comm_page: .skip 4096 /* 4KB for comm page */
 p3_table: .skip 4096
 p2_table_base: .skip 32768    /* 8 x 4096 = 32KB for 8 L2 tables */
+p3_comm: .skip 4096
+p2_comm: .skip 4096
+p1_comm: .skip 4096
+.align 16
 stack_bottom: .skip 65536
 .global stack_top
 stack_top:
+
+.align 16
+df_stack_bottom: .skip 4096
+.global df_stack_top
+df_stack_top:

@@ -16,6 +16,17 @@ pub fn panic(msg: []const u8, error_return_trace: anytype, ret_addr: ?usize) nor
 }
 
 const macho = @import("macho.zig");
+const vmm = @import("vmm.zig");
+const pmm = @import("pmm.zig");
+
+const MachMessageHeader = extern struct {
+    msgh_bits: u32,
+    msgh_size: u32,
+    msgh_remote_port: u32,
+    msgh_local_port: u32,
+    msgh_reserved: u32,
+    msgh_id: i32,
+};
 
 // ... imports ...
 
@@ -27,6 +38,7 @@ pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
 
     gdt.init(@intFromPtr(&stack_top));
     idt.init();
+    vmm.setup();
 
     // ... magic parsing ...
     if (magic != 0x36D76289 and magic != 0x2BADB002) {
@@ -88,21 +100,28 @@ pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
                 enable_features();
 
                 // Setup stack for dyld
-                // Use lower addresses to be safe within 1GB RAM if needed
-                // Text: 0x10000000 (256MB) is fine
-                // Stack: 0x20000000 (512MB) seems safer than 0x70000000 (1.79GB)
-                // BUT boot.S maps 8GB! So 0x70000000 is virtual.
-                // Does physical RAM back it? -m 1G means only 1GB RAM.
-                // The identity map maps VIRTUAL 0..8GB to PHYSICAL 0..8GB.
-                // So 0x70000000 maps to 0x70000000 physical.
-                // With 1GB RAM, 0x70000000 is OUT OF BOUNDS.
-                // accessing it will cause a fault or read/write ignore.
-
                 const user_stack_top: u64 = 0x20000000; // 512MB - safely inside 1GB
+                const stackSize: u64 = 0x4000; // 16KB
+                // const stackStartVirt = user_stack_top - stackSize;
 
-                // Zero out the stack page (4KB)
-                const stack_page: [*]u8 = @ptrFromInt(user_stack_top - 0x1000);
-                _ = memset(stack_page, 0, 0x1000);
+                // Allocate physical frames and map them into the user stack range
+                var i_map: u64 = 0;
+                while (i_map < (stackSize / 4096)) : (i_map += 1) {
+                    if (pmm.allocateFrame()) |frame| {
+                        vmm.map(user_stack_top - ((i_map + 1) * 4096), frame, 7);
+                    }
+                }
+
+                // Zero out the stack pages we just mapped
+                const sp_page: [*]u8 = @ptrFromInt(user_stack_top - stackSize);
+                _ = memset(sp_page, 0, @as(usize, stackSize));
+
+                // Sanity-check: write/read a marker at top of user stack
+                const test_ptr: *u64 = @ptrFromInt(@as(usize, @intCast(user_stack_top - 8)));
+                test_ptr.* = 0xDEADBEEF;
+                kprint("Wrote marker to user stack: ");
+                kprintHex(test_ptr.*);
+                kprint("\n");
 
                 const user_sp = setupDyldStack("init", res.text_base, res.entry_point, user_stack_top);
 
@@ -112,7 +131,26 @@ pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
                 kprintHex(user_sp);
                 kprint("\n");
 
-                jump_to_user(res.entry_point, user_sp);
+                if (TEST_USER_LOOP) {
+                    // Place an int3 instruction on the mapped user stack to test execution
+                    const test_entry: u64 = user_stack_top - 0x100;
+                    const entry_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(test_entry)));
+                    entry_ptr[0] = 0xCC; // int3
+                    kprint("Wrote int3 at user stack entry\n");
+
+                    // Write infinite loop and jump to it in user mode
+                    entry_ptr[0] = 0xEB;
+                    entry_ptr[1] = 0xFE;
+                    kprint("Wrote test loop at user stack entry\n");
+                    dumpCR3AndPML4();
+                    dumpPageTables(test_entry);
+                    dumpPageTables(res.entry_point);
+                    jump_to_user(test_entry, user_sp);
+                } else {
+                    dumpCR3AndPML4();
+                    dumpPageTables(res.entry_point);
+                    jump_to_user(res.entry_point, user_sp);
+                }
             } else {
                 kprint("Failed to load dyld Mach-O\n");
             }
@@ -130,6 +168,79 @@ const MachOLoadResult = struct {
     entry_point: u64,
     text_base: u64,
 };
+
+fn dumpPageTables(virt: u64) void {
+    const pml4Index: usize = @intCast((virt >> 39) & 0x1FF);
+    const pdptIndex: usize = @intCast((virt >> 30) & 0x1FF);
+    const pdIndex: usize = @intCast((virt >> 21) & 0x1FF);
+    const ptIndex: usize = @intCast((virt >> 12) & 0x1FF);
+
+    kprint("Page tables for ");
+    kprintHex(virt);
+    kprint("\n");
+    const pml4e = vmm.pml4[pml4Index];
+    kprint(" PML4[");
+    kprintHex(@as(u64, pml4Index));
+    kprint("]: ");
+    kprintHex(pml4e);
+    kprint("\n");
+    if ((pml4e & 1) == 0) return;
+    const pdpt: [*]u64 = @ptrFromInt(@as(usize, @intCast(pml4e & ~(@as(u64, 0xFFF)))));
+    const pdpte = pdpt[pdptIndex];
+    kprint(" PDPT[");
+    kprintHex(@as(u64, pdptIndex));
+    kprint("]: ");
+    kprintHex(pdpte);
+    kprint("\n");
+    if ((pdpte & 1) == 0) return;
+    const pd: [*]u64 = @ptrFromInt(@as(usize, @intCast(pdpte & ~(@as(u64, 0xFFF)))));
+    const pde = pd[pdIndex];
+    kprint(" PD[");
+    kprintHex(@as(u64, pdIndex));
+    kprint("]: ");
+    kprintHex(pde);
+    kprint("\n");
+    if ((pde & 1) == 0) return;
+    if ((pde & @as(u64, 0x80)) != 0) {
+        kprint(" 2MB huge page\n");
+        return;
+    }
+    const pt: [*]u64 = @ptrFromInt(@as(usize, @intCast(pde & ~(@as(u64, 0xFFF)))));
+    const pte = pt[ptIndex];
+    kprint(" PT[");
+    kprintHex(@as(u64, ptIndex));
+    kprint("]: ");
+    kprintHex(pte);
+    kprint("\n");
+}
+
+fn dumpCR3AndPML4() void {
+    var cr3: u64 = undefined;
+    asm volatile ("mov %%cr3, %[cr3]"
+        : [cr3] "=r" (cr3),
+    );
+    kprint("CR3: 0x");
+    kprintHex(cr3);
+    kprint("\n");
+
+    // Print PML4 pointer registered in vmm
+    kprint("vmm.pml4 ptr: ");
+    kprintHex(@as(u64, @intFromPtr(vmm.pml4)));
+    kprint("\n");
+
+    // Print first few PML4 entries for visibility
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const e = vmm.pml4[i];
+        kprint("  PML4[");
+        kprintHex(@as(u64, i));
+        kprint("]: ");
+        kprintHex(e);
+        kprint("\n");
+    }
+}
+
+const TEST_USER_LOOP: bool = false; // If true, overwrite user entry with infinite loop for testing
 
 fn loadMachO(data: []const u8, slide: u64) ?MachOLoadResult {
     if (data.len < @sizeOf(macho.MachHeader64)) return null;
@@ -330,9 +441,7 @@ fn setup_syscalls() void {
     //   For now, just Setting STAR to something valid prevents #GP on `syscall`.
 
     const k_cs = 0x08;
-    const u_cs_base = 0x10; // Try 0x10 (KData). Result: CS=0x20(UData), SS=0x18(UCode).
-    // If user CS is 0x1B (0x18|3) and SS is 0x23 (0x20|3).
-    // SYSRET loads CS selector with (Base+16)|3.
+    const u_cs_base = 0x10; // SYSRET: CS = (base+16)|3 = 0x23, SS = (base+8)|3 = 0x1B
 
     // Low 32: EIP (legacy setup, unused in long mode)
     const star: u64 = (@as(u64, u_cs_base) << 48) | (@as(u64, k_cs) << 32);
@@ -353,19 +462,11 @@ fn write_msr(msr: u32, val: u64) void {
     );
 }
 
-export fn syscall_handler_stub() callconv(.naked) void {
-    asm volatile (
-        \\ swapgs
-        \\ mov %rsp, %gs:8
-        \\ sti
-        \\ 1: hlt
-        \\ jmp 1b
-    );
-}
+extern fn syscall_handler_stub() void;
 
 fn jump_to_user(entry: u64, sp: u64) noreturn {
-    const user_cs: u64 = 0x1B; // 0x18 | 3
-    const user_ss: u64 = 0x23; // 0x20 | 3
+    const user_cs: u64 = 0x23; // 0x20 | 3
+    const user_ss: u64 = 0x1B; // 0x18 | 3
     const rflags: u64 = 0x202; // IF=1, bit 1=1
 
     // Debug print
@@ -496,6 +597,157 @@ pub export fn memcmp(s1: [*]const u8, s2: [*]const u8, n: usize) i32 {
     return 0;
 }
 
+pub export fn syscall_dispatch(nr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) u64 {
+    kprint("SYSCALL: 0x");
+    kprintHex(nr);
+    kprint("\n");
+
+    _ = arg4;
+    _ = arg5;
+    _ = arg6;
+
+    // Mask off the class bits (e.g. 0x2000000)
+    // BSD syscalls are class 2.
+    // 0x2000004 => 4
+    const class = nr >> 24;
+    const call_nr = nr & 0xFFFFFF; // Full number without class? No, class is high byte?
+    // 0x2000004 -> Class 2 (0x02), Nr 4.
+    // 0x100001C -> Class 1 (0x01), Nr 28.
+    // 0x3000003 -> Class 3 (0x03), Nr 3.
+
+    // Mach Traps (Class 1) often just use low bits.
+    // BSD (Class 2).
+    // MDEP (Class 3).
+
+    // We switch on the FULL number for simplicity if small enough, but switch on logic is cleaner.
+
+    if (class == 0x01) { // Mach
+        const trap = call_nr;
+        switch (trap) {
+            10 => { // _kernelrpc_mach_vm_allocate_trap(target, *addr, size, flags)
+                // We should write back the allocated address if *addr is valid?
+                // arg2 is pointer to address.
+                // Simple hack: don't write back, return 0 (KERN_SUCCESS).
+                // Wait, if we don't write back, caller sees garbage.
+                // We should probably write some address.
+                // But we don't have VM allocator yet!
+                // Just return success.
+                return 0;
+            },
+            12 => return 0, // vm_deallocate
+            14 => { // _kernelrpc_mach_vm_map_trap
+                return 0;
+            },
+            15 => { // port_allocate
+                // Write back port? arg2 is pointer to port name.
+                // const port_ptr: *u32 = @ptrFromInt(arg2);
+                // port_ptr.* = 0x100;
+                return 0;
+            },
+            26 => return 5, // mach_reply_port
+            27 => return 6, // thread_self_trap
+            28 => return 7, // task_self_trap
+            29 => return 8, // host_self_trap
+            31 => { // mach_msg_trap
+                // args: msg, option, send_size, rcv_size, rcv_name, timeout, notify
+                const msg_ptr: *MachMessageHeader = @ptrFromInt(arg1);
+                const option = arg2;
+                _ = msg_ptr;
+                _ = option;
+
+                // Debug print msg id
+                // kprint("mach_msg id=");
+                // kprintHex(msg_ptr.msgh_id);
+                // kprint(" opt=");
+                // kprintHex(option);
+                // kprint("\n");
+
+                // If MACH_RCV_MSG (bit 1) is set, we might need to wait or return timeout?
+                // If timeout is 0, return TIMEOUT immediately if no message?
+                // For now, if SEND and RCV are set, we just pretend we sent and didn't receive?
+                // Or return SUCCESS?
+                // Logic from Swift kernel: if RCV is set, return various codes.
+
+                return 0; // MACH_MSG_SUCCESS
+            },
+            else => {
+                kprint("Unknown Mach Trap: ");
+                kprintHex(trap);
+                kprint("\n");
+                return 0; // KERN_SUCCESS
+            },
+        }
+    } else if (class == 0x03) { // MDEP
+        if (call_nr == 3) {
+            // thread_fast_set_cthread_self
+            write_msr(0xC0000101, arg1); // GS_BASE
+            return 0;
+        }
+        kprint("Unknown MDEP syscall: ");
+        kprintHex(call_nr);
+        kprint("\n");
+        return 0;
+    } else { // BSD (Class 2) or generic
+        const sys = call_nr & 0x1FF; // Mask to 511
+        switch (sys) {
+            1 => { // exit
+                kprint("Process exited with code: ");
+                kprintHex(arg1);
+                kprint("\n");
+                while (true) asm volatile ("hlt");
+            },
+            3 => return 0, // read (stub)
+            4 => { // write
+                const fd = arg1;
+                const buf: [*]const u8 = @ptrFromInt(arg2);
+                const count = arg3;
+                if (fd == 1 or fd == 2) {
+                    var i: usize = 0;
+                    while (i < count) : (i += 1) {
+                        if (buf[i] == 10) serial_putc(13);
+                        serial_putc(buf[i]);
+                    }
+                    return count;
+                }
+                return count;
+            },
+            20 => return 1, // getpid
+            33 => return 0, // access (success)
+            74 => return 0, // mprotect
+            197 => { // mmap
+                if (arg1 != 0) return arg1;
+                return 0x80000000;
+            },
+            202 => return 0, // sysctl (success?)
+            294 => { // shared_region_check_np(u64 *start_address)
+                if (arg1 != 0) {
+                    const ptr: *u64 = @ptrFromInt(arg1);
+                    ptr.* = 0; // No shared region
+                }
+                return 0;
+            },
+            302 => return 0, // __pthread_sigmask
+            327 => return 0, // issetugid
+            372 => return 6, // thread_selfid (match thread port?)
+            500 => { // getentropy(buf, len)
+                const buf: [*]u8 = @ptrFromInt(arg1);
+                const len = arg2;
+                var i: usize = 0;
+                while (i < len) : (i += 1) {
+                    buf[i] = @truncate(i); // simple pattern
+                }
+                return 0;
+            },
+            else => {
+                kprint("Unknown BSD syscall: ");
+                kprintHex(nr); // Print full NR
+                kprint("\n");
+                return 0; // Success? Or -1?
+            },
+        }
+    }
+}
+
 // Exception Handler
 pub export fn exception_handler(vector: u64, err_code: u64, rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64) callconv(.c) void {
     kprint("\nEXCEPTION: ");
@@ -512,6 +764,13 @@ pub export fn exception_handler(vector: u64, err_code: u64, rip: u64, cs: u64, r
     kprintHex(rsp);
     kprint(" SS: ");
     kprintHex(ss);
+
+    var ds: u64 = 0;
+    asm volatile ("mov %%ds, %[ds]" : [ds] "=r" (ds));
+    kprint(" DS: ");
+    kprintHex(ds);
+    kprint("\n");
+
     var cr2: u64 = undefined;
     asm volatile ("mov %%cr2, %[cr2]"
         : [cr2] "=r" (cr2),

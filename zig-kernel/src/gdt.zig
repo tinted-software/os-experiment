@@ -34,13 +34,12 @@ var tss: TssEntry align(16) = .{};
 
 var gdt = [_]u64{
     0, // Null
-    0x00af9b000000ffff, // Kernel Code 64
-    0x00cf93000000ffff, // Kernel Data 64
-    0x00affb000000ffff, // User Code 64
-    0x00cff3000000ffff, // User Data 64
-    0x00affa000000ffff, // Kernel Code 32 (optional but kept for compatibility with runtime.c)
-    0, // TSS Low
-    0, // TSS High
+    0x00af9b000000ffff, // Kernel Code 64 (0x08)
+    0x00cf93000000ffff, // Kernel Data 64 (0x10)
+    0x00cff3000000ffff, // User Data 64 (0x18)
+    0x00affb000000ffff, // User Code 64 (0x20)
+    0, // TSS Low (0x28)
+    0, // TSS High (0x30)
 };
 
 extern fn load_gdt(ptr: *const anyopaque) void;
@@ -54,15 +53,19 @@ pub fn init(kstack: u64) void {
     tss.rsp0_hi = @truncate(kstack >> 32);
     tss.iopb = @sizeOf(TssEntry);
 
+    tss.ist1_lo = @truncate(@intFromPtr(&df_stack_top));
+    tss.ist1_hi = @truncate(@intFromPtr(&df_stack_top) >> 32);
+
     const base = @intFromPtr(&tss);
     const limit: u32 = @sizeOf(TssEntry) - 1;
 
-    gdt[6] = (limit & 0xffff) |
+    gdt[5] = (limit & 0xffff) |
         ((base & 0xffff) << 16) |
-        ((base & 0xff0000) << 16) |
+        (((base >> 16) & 0xff) << 32) |
         (@as(u64, 0x89) << 40) |
-        (((base & 0xff000000) >> 24) << 56);
-    gdt[7] = (base >> 32);
+        (@as(u64, (limit >> 16) & 0xf) << 48) |
+        (((base >> 24) & 0xff) << 56);
+    gdt[6] = (base >> 32);
 
     const Gdtr = packed struct(u80) {
         limit: u16,
@@ -79,7 +82,9 @@ pub fn init(kstack: u64) void {
 
     asm volatile ("ltr %%ax"
         :
-        : [ax] "{ax}" (@as(u16, 0x30)),
+        : [ax] "{ax}" (@as(u16, 0x28)),
     );
     main.kprint("TSS loaded\n");
 }
+
+extern var df_stack_top: u8;
