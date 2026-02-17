@@ -1,0 +1,137 @@
+const main = @import("main.zig");
+
+pub const IdtEntry = extern struct {
+    offset_lo: u16,
+    selector: u16,
+    ist: u8,
+    type_attr: u8,
+    offset_mid: u16,
+    offset_hi: u32,
+    reserved: u32,
+};
+
+var idt: [256]IdtEntry align(16) = undefined;
+
+pub fn setGate(num: u8, handler: u64, ist: u8, type_attr: u8) void {
+    idt[num] = .{
+        .offset_lo = @truncate(handler),
+        .selector = 0x08, // Kernel code
+        .ist = ist,
+        .type_attr = type_attr,
+        .offset_mid = @truncate(handler >> 16),
+        .offset_hi = @truncate(handler >> 32),
+        .reserved = 0,
+    };
+}
+
+extern fn load_idt(ptr: *const anyopaque) void;
+
+pub fn init() void {
+    for (0..256) |i| {
+        setGate(@intCast(i), @intFromPtr(&irq_stub_generic), 0, 0x8E);
+    }
+
+    // Set up specific exception stubs (0-20)
+    setGate(0, @intFromPtr(&isr_stub_0), 0, 0x8E);
+    setGate(1, @intFromPtr(&isr_stub_1), 0, 0x8E);
+    setGate(2, @intFromPtr(&isr_stub_2), 0, 0x8E);
+    setGate(3, @intFromPtr(&isr_stub_3), 0, 0x8E);
+    setGate(4, @intFromPtr(&isr_stub_4), 0, 0x8E);
+    setGate(5, @intFromPtr(&isr_stub_5), 0, 0x8E);
+    setGate(6, @intFromPtr(&isr_stub_6), 0, 0x8E);
+    setGate(7, @intFromPtr(&isr_stub_7), 0, 0x8E);
+    setGate(8, @intFromPtr(&isr_stub_8), 0, 0x8E);
+    setGate(9, @intFromPtr(&isr_stub_9), 0, 0x8E);
+    setGate(10, @intFromPtr(&isr_stub_10), 0, 0x8E);
+    setGate(11, @intFromPtr(&isr_stub_11), 0, 0x8E);
+    setGate(12, @intFromPtr(&isr_stub_12), 0, 0x8E);
+    setGate(13, @intFromPtr(&isr_stub_13), 0, 0x8E);
+    setGate(14, @intFromPtr(&isr_stub_14), 0, 0x8E);
+    setGate(15, @intFromPtr(&isr_stub_15), 0, 0x8E);
+    setGate(16, @intFromPtr(&isr_stub_16), 0, 0x8E);
+    setGate(17, @intFromPtr(&isr_stub_17), 0, 0x8E);
+    setGate(18, @intFromPtr(&isr_stub_18), 0, 0x8E);
+    setGate(19, @intFromPtr(&isr_stub_19), 0, 0x8E);
+    setGate(20, @intFromPtr(&isr_stub_20), 0, 0x8E);
+
+    const Idtr = packed struct(u80) {
+        limit: u16,
+        base: u64,
+    };
+
+    const idtr = Idtr{
+        .limit = @sizeOf(@TypeOf(idt)) - 1,
+        .base = @intFromPtr(&idt),
+    };
+
+    load_idt(&idtr);
+    main.kprint("IDT loaded\n");
+}
+
+pub export fn exception_handler(
+    vector: u64,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+) void {
+    main.kprint("\n=== Zig EXCEPTION ===\n");
+    main.kprint("Vector: ");
+    main.kprintHex(vector);
+    main.kprint("\n");
+    main.kprint("Error:  ");
+    main.kprintHex(error_code);
+    main.kprint("\n");
+    main.kprint("RIP:    ");
+    main.kprintHex(rip);
+    main.kprint("\n");
+    main.kprint("CS:     ");
+    main.kprintHex(cs);
+    main.kprint("\n");
+    main.kprint("RFLAGS: ");
+    main.kprintHex(rflags);
+    main.kprint("\n");
+    main.kprint("RSP:    ");
+    main.kprintHex(rsp);
+    main.kprint("\n");
+    main.kprint("SS:     ");
+    main.kprintHex(ss);
+    main.kprint("\n");
+
+    var cr2: u64 = undefined;
+    asm volatile ("mov %%cr2, %[cr2]"
+        : [cr2] "=r" (cr2),
+    );
+    main.kprint("CR2:    ");
+    main.kprintHex(cr2);
+    main.kprint("\n");
+
+    while (true) {
+        asm volatile ("hlt");
+    }
+}
+
+extern fn isr_stub_0() void;
+extern fn isr_stub_1() void;
+extern fn isr_stub_2() void;
+extern fn isr_stub_3() void;
+extern fn isr_stub_4() void;
+extern fn isr_stub_5() void;
+extern fn isr_stub_6() void;
+extern fn isr_stub_7() void;
+extern fn isr_stub_8() void;
+extern fn isr_stub_9() void;
+extern fn isr_stub_10() void;
+extern fn isr_stub_11() void;
+extern fn isr_stub_12() void;
+extern fn isr_stub_13() void;
+extern fn isr_stub_14() void;
+extern fn isr_stub_15() void;
+extern fn isr_stub_16() void;
+extern fn isr_stub_17() void;
+extern fn isr_stub_18() void;
+extern fn isr_stub_19() void;
+extern fn isr_stub_20() void;
+extern fn irq_stub_generic() void;
