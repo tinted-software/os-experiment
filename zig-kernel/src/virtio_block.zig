@@ -1,143 +1,146 @@
+const std = @import("std");
+const main = @import("main.zig");
 const virtio = @import("virtio.zig");
+const pmm = @import("pmm.zig");
 
-extern fn asm_pause() void;
-extern fn asm_volatile_barrier() void;
-extern fn kernel_alloc(size: usize, alignment: usize) ?*u8;
+pub const VIRTIO_PCI_DEVICE_BLOCK: u16 = 0x1001;
 
-const VIRTIO_PCI_DEVICE_BLOCK: u16 = 0x1001;
+pub const VIRTIO_BLK_T_IN: u32 = 0;
+pub const VIRTIO_BLK_T_OUT: u32 = 1;
 
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-
-const VirtioBlkOuthdr = extern struct {
-    typ: u32,
+pub const VirtioBlkOuthdr = extern struct {
+    type: u32,
     reserved: u32,
     sector: u64,
 };
 
-const VirtioBlkStatus = extern struct { status: u8 };
-
-const VirtioBlkDevice = struct {
+pub const VirtioBlkDevice = struct {
     config: virtio.VirtioConfig,
-    queueSize: usize,
-    desc: ?*virtio.VirtqDesc,
-    avail: ?*virtio.VirtqAvail,
-    used: ?*virtio.VirtqUsed,
-    lastUsedIdx: u16,
+    queue_size: u16,
+    desc: [*]virtio.VirtqDesc,
+    avail: *virtio.VirtqAvail,
+    used: *virtio.VirtqUsed,
+    last_used_idx: u16 = 0,
 };
 
-pub var blockDevice: ?*VirtioBlkDevice = null;
+var device: ?VirtioBlkDevice = null;
 
-pub fn initVirtioBlock() void {
-    // Probe
-    const dev = virtio.scanPci(virtio.VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_BLOCK) orelse return;
+pub fn init() void {
+    main.kprint("Block Probe\n");
+    const pci_dev = virtio.scanPci(virtio.VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_BLOCK) orelse {
+        main.kprint("Block NOT FOUND\n");
+        return;
+    };
+    main.kprint("Block Found\n");
 
-    // Enable PCI Command register: IO, Mem, Bus Master
-    const cmd = virtio.pciRead16(dev.bus, dev.slot, dev.func, 4);
-    virtio.pciWrite16(dev.bus, dev.slot, dev.func, 4, cmd | 0x7);
+    // Enable PCI Bus Master and Memory Space
+    const cmd = virtio.pciRead16(pci_dev.bus, pci_dev.slot, pci_dev.func, 4);
+    virtio.pciWrite16(pci_dev.bus, pci_dev.slot, pci_dev.func, 4, cmd | 0x7);
 
-    var config: virtio.VirtioConfig = .{ .common = null, .notify = null, .isr = null, .device = null, .notify_off_multiplier = 0 };
-    virtio.parseVirtioCapabilities(dev, &config);
+    var config = virtio.VirtioConfig{};
+    virtio.parseCapabilities(pci_dev, &config);
 
     if (config.common) |common| {
-        // Reset and driver handshake
-        common.*.device_status = 0;
-        common.*.device_status |= 1; // ACK
-        common.*.device_status |= 2; // DRIVER
-        common.*.device_status |= 8; // FEATURES_OK
+        main.kprint("Block Init\n");
+        common.device_status = 0; // Reset
+        common.device_status |= 1; // Acknowledge
+        common.device_status |= 2; // Driver
 
-        common.*.queue_select = 0;
-        const qSize: usize = @intCast(common.*.queue_size);
+        common.device_status |= 8; // FEATURES_OK
 
-        // Allocate virtqueue backing memory (desc + avail + used) with alignment
-        const desc_bytes = qSize * 16;
-        // const avail_bytes = 8 + qSize * 2;
-        const used_bytes = 8 + qSize * 8;
-        const vq_size = ((desc_bytes + 8 + qSize * 2 + 4095) & ~4095) + ((used_bytes + 4095) & ~4095);
+        common.queue_select = 0;
+        const q_size = common.queue_size;
+        main.kprint("  Queue Size: ");
+        main.kprintHex(q_size);
+        main.kprint("\n");
 
-        const rawPtr = kernel_alloc(vq_size, 4096) orelse return;
+        // Simple allocation for virtqueue (Desc + Avail + Used)
+        // Desc: 16 bytes * q_size
+        // Avail: 6 bytes + 2 * q_size
+        // Used: 6 bytes + 8 * q_size
+        const vq_size = (16 * @as(usize, q_size) + 4095) & ~@as(usize, 4095);
+        const avail_size = (6 + 2 * @as(usize, q_size) + 4095) & ~@as(usize, 4095);
+        const used_size = (6 + 8 * @as(usize, q_size) + 4095) & ~@as(usize, 4095);
 
-        const descPtr: *virtio.VirtqDesc = @ptrCast(rawPtr);
-        const availPtr: *virtio.VirtqAvail = @ptrCast(@as(*virtio.VirtqAvail, @ptrFromInt(@intFromPtr(rawPtr) + desc_bytes)));
-        const usedPtr: *virtio.VirtqUsed = @ptrCast(@as(*virtio.VirtqUsed, @ptrFromInt(@intFromPtr(rawPtr) + ((desc_bytes + 8 + qSize * 2 + 4095) & ~4095))));
+        const desc_phys = pmm.allocateFrames((vq_size + avail_size + used_size) / 4096) orelse return;
+        const avail_phys = desc_phys + vq_size;
+        const used_phys = avail_phys + avail_size;
 
-        common.*.queue_desc = @as(u64, @intFromPtr(descPtr));
-        common.*.queue_driver = @as(u64, @intFromPtr(availPtr));
-        common.*.queue_device = @as(u64, @intFromPtr(usedPtr));
-        common.*.queue_enable = 1;
+        common.queue_desc = desc_phys;
+        common.queue_driver = avail_phys;
+        common.queue_device = used_phys;
+        common.queue_enable = 1;
 
-        common.*.device_status |= 128; // DRIVER_OK
+        common.device_status |= 128; // DRIVER_OK
+        main.kprint("Block READY\n");
 
-        // Allocate device struct storage
-        const dev_ptr = kernel_alloc(@sizeOf(VirtioBlkDevice), 16) orelse return;
-        const dev_struct: *VirtioBlkDevice = @ptrCast(dev_ptr);
-        dev_struct.* = VirtioBlkDevice{ .config = config, .queueSize = qSize, .desc = descPtr, .avail = availPtr, .used = usedPtr, .lastUsedIdx = 0 };
-        blockDevice = dev_struct;
+        device = VirtioBlkDevice{
+            .config = config,
+            .queue_size = q_size,
+            .desc = @ptrFromInt(desc_phys),
+            .avail = @ptrFromInt(avail_phys),
+            .used = @ptrFromInt(used_phys),
+        };
     }
 }
 
-pub fn virtioBlockRead(sector: u64, count: usize, buffer: *u8) bool {
-    if (count == 0) return true;
-    const dev = blockDevice orelse return false;
-    const d = dev.*;
-    const qSize = d.queueSize;
-    const descs = d.desc orelse return false;
-    const avail = d.avail orelse return false;
+pub fn read(sector: u64, count: u32, buffer: [*]u8) bool {
+    const dev = device orelse return false;
+    
+    // We need some memory for the header and status
+    // For now, let's use a static buffer or temporary frames
+    // SwiftOS used kernelAlloc. Here we'll use some space near the end of our identity map or just a static buffer.
+    // Let's use a static buffer for simplicity in this prototype.
+    const Request = struct {
+        hdr: VirtioBlkOuthdr align(16),
+        status: u8 align(16),
+    };
+    var req: Request = undefined;
+    req.hdr.type = VIRTIO_BLK_T_IN;
+    req.hdr.reserved = 0;
+    req.hdr.sector = sector;
+    req.status = 0xFF;
 
-    const hdr_ptr = kernel_alloc(@sizeOf(VirtioBlkOuthdr), 16) orelse return false;
-    const status_ptr = kernel_alloc(1, 1) orelse return false;
-    const hdr: *virtio.VirtioBlkOuthdr = @ptrCast(hdr_ptr);
-    const status: *u8 = @ptrCast(status_ptr);
+    dev.desc[0].addr = @intFromPtr(&req.hdr);
+    dev.desc[0].len = @sizeOf(VirtioBlkOuthdr);
+    dev.desc[0].flags = virtio.VIRTQ_DESC_F_NEXT;
+    dev.desc[0].next = 1;
 
-    hdr.* = VirtioBlkOuthdr{ .typ = VIRTIO_BLK_T_IN, .reserved = 0, .sector = sector };
-    status.* = 0xFF;
+    dev.desc[1].addr = @intFromPtr(buffer);
+    dev.desc[1].len = count * 512;
+    dev.desc[1].flags = virtio.VIRTQ_DESC_F_NEXT | virtio.VIRTQ_DESC_F_WRITE;
+    dev.desc[1].next = 2;
 
-    descs[0].addr = @as(u64, @intFromPtr(hdr));
-    descs[0].len = @as(u32, @sizeOf(VirtioBlkOuthdr));
-    descs[0].flags = virtio.VIRTQ_DESC_F_NEXT;
-    descs[0].next = 1;
+    dev.desc[2].addr = @intFromPtr(&req.status);
+    dev.desc[2].len = 1;
+    dev.desc[2].flags = virtio.VIRTQ_DESC_F_WRITE;
+    dev.desc[2].next = 0;
 
-    descs[1].addr = @as(u64, @intFromPtr(buffer));
-    descs[1].len = @as(u32, count * 512);
-    descs[1].flags = virtio.VIRTQ_DESC_F_NEXT | virtio.VIRTQ_DESC_F_WRITE;
-    descs[1].next = 2;
+    const ring: [*]u16 = @ptrFromInt(@intFromPtr(dev.avail) + 4);
+    ring[dev.avail.idx % dev.queue_size] = 0;
 
-    descs[2].addr = @as(u64, @intFromPtr(status));
-    descs[2].len = 1;
-    descs[2].flags = virtio.VIRTQ_DESC_F_WRITE;
-    descs[2].next = 0;
+    asm volatile ("" ::: "memory");
+    dev.avail.idx +%= 1;
+    asm volatile ("" ::: "memory");
 
-    // Update avail ring: ring starts 4 bytes after avail struct
-    const ring_ptr: [*]u16 = @ptrCast(@as([*]u16, @ptrFromInt(@intFromPtr(avail) + 4)));
-    const availIdx: usize = @intCast(avail.*.idx % @as(u16, qSize));
-    ring_ptr[availIdx] = 0; // head of descriptor chain
-
-    asm_volatile_barrier();
-
-    avail.*.idx = avail.*.idx + 1;
-
-    // Notify
-    if (d.config.notify) |notify_ptr| {
-        if (d.config.common) |common_ptr| {
-            common_ptr.*.queue_select = 0;
-            const off = @as(usize, common_ptr.*.queue_notify_off) * @as(usize, d.config.notify_off_multiplier);
-            const notify_addr: *u16 = @ptrCast(@as(*u16, @ptrFromInt(@intFromPtr(notify_ptr) + off)));
-            notify_addr.* = 0;
+    if (dev.config.notify) |notify| {
+        if (dev.config.common) |common| {
+            common.queue_select = 0;
+            const off = common.queue_notify_off * dev.config.notify_off_multiplier;
+            notify[off] = 0; // Queue index
         }
     }
 
     var timeout: usize = 10_000_000;
-    while (d.used.*.idx == d.lastUsedIdx and timeout > 0) {
-        asm_pause();
-        timeout -= 1;
+    while (dev.used.idx == dev.last_used_idx and timeout > 0) : (timeout -= 1) {
+        asm volatile ("pause");
     }
 
     if (timeout == 0) {
+        main.kprint("Block Read TIMEOUT\n");
         return false;
     }
 
-    // update lastUsedIdx
-    d.lastUsedIdx = d.used.*.idx;
-
-    return status.* == 0;
+    device.?.last_used_idx = dev.used.idx;
+    return req.status == 0;
 }

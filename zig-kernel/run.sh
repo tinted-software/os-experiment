@@ -20,6 +20,8 @@ echo "Running QEMU..."
 qemu-system-x86_64 -cpu max \
     -kernel kernel32.elf \
     -initrd ramdisk.cpio \
+    -drive file=shared_cache.img,if=none,format=raw,id=hd0 \
+    -device virtio-blk-pci,drive=hd0 \
     -serial mon:stdio \
     -display none \
     -m 1G

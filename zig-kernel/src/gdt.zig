@@ -80,11 +80,25 @@ pub fn init(kstack: u64) void {
     load_gdt(&gdtr);
     main.kprint("GDT loaded\n");
 
+    const MSR_KERNEL_GS_BASE = 0xC0000102;
+    write_msr(MSR_KERNEL_GS_BASE, base);
+
     asm volatile ("ltr %%ax"
         :
         : [ax] "{ax}" (@as(u16, 0x28)),
     );
     main.kprint("TSS loaded\n");
+}
+
+fn write_msr(msr: u32, val: u64) void {
+    const lo: u32 = @truncate(val);
+    const hi: u32 = @truncate(val >> 32);
+    asm volatile ("wrmsr"
+        :
+        : [lo] "{eax}" (lo),
+          [hi] "{edx}" (hi),
+          [msr] "{ecx}" (msr),
+    );
 }
 
 extern var df_stack_top: u8;

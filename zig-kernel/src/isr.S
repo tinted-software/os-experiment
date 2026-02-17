@@ -77,6 +77,9 @@ isr_common:
     /* Check again if we are returning to user mode */
     testq $3, 8(%rsp)
     jz 2f
+    mov $0x1B, %ax
+    mov %ax, %ds
+    mov %ax, %es
     swapgs
 2:
     iretq
@@ -159,6 +162,11 @@ syscall_handler_stub:
     pop %r11
     pop %rcx
     
+    /* Restore user data segments */
+    mov $0x1B, %ax
+    mov %ax, %ds
+    mov %ax, %es
+
     /* Build iretq frame */
     pushq $0x1B    /* SS */
     pushq syscall_user_rsp(%rip) /* RSP */

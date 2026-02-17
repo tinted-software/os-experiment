@@ -1,7 +1,14 @@
+const std = @import("std");
 const gdt = @import("gdt.zig");
 const idt = @import("idt.zig");
 const multiboot = @import("multiboot.zig");
 const cpio = @import("cpio.zig");
+const macho = @import("macho.zig");
+const vmm = @import("vmm.zig");
+const pmm = @import("pmm.zig");
+const vfs = @import("vfs.zig");
+const mach_ipc = @import("mach_ipc.zig");
+const virtio_block = @import("virtio_block.zig");
 
 // Assembly symbols
 extern var stack_top: u8;
@@ -15,10 +22,6 @@ pub fn panic(msg: []const u8, error_return_trace: anytype, ret_addr: ?usize) nor
     }
 }
 
-const macho = @import("macho.zig");
-const vmm = @import("vmm.zig");
-const pmm = @import("pmm.zig");
-
 const MachMessageHeader = extern struct {
     msgh_bits: u32,
     msgh_size: u32,
@@ -28,10 +31,6 @@ const MachMessageHeader = extern struct {
     msgh_id: i32,
 };
 
-// ... imports ...
-
-// ... defines ...
-
 pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
     serial_init();
     kprint("Zig OS Kernel Booting...\n");
@@ -39,8 +38,9 @@ pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
     gdt.init(@intFromPtr(&stack_top));
     idt.init();
     vmm.setup();
+    virtio_block.init();
+    vfs.mountBlockDevice();
 
-    // ... magic parsing ...
     if (magic != 0x36D76289 and magic != 0x2BADB002) {
         kprint("Error: Invalid Multiboot magic: 0x");
         kprintHex(magic);
@@ -81,84 +81,66 @@ pub export fn kmain(magic: u32, info_addr: u32) callconv(.c) noreturn {
             kprint("Ramdisk found via MB1 at 0x");
             kprintHex(mod.mod_start);
             kprint("\n");
-        } else {
-            kprint("No modules found in MB1 info\n");
         }
     }
 
     if (ramdisk_addr) |rd| {
         const rd_slice = rd[0..ramdisk_len];
+        vfs.initRamdisk(rd_slice);
         if (cpio.findFile(rd_slice, "usr/lib/dyld")) |dyld_data| {
             kprint("Found dyld! Loading...\n");
 
-            // Load dyld at 0x10000000 (256MB)
-            if (loadMachO(dyld_data, 0x10000000)) |res| {
+            // Load dyld at 0x10000000 (slide)
+            if (loadMachO(dyld_data, 0x10000000)) |dyld_res| {
                 kprint("dyld loaded. Entry: 0x");
-                kprintHex(res.entry_point);
+                kprintHex(dyld_res.entry_point);
                 kprint("\n");
 
-                enable_features();
-
-                // Setup stack for dyld
-                const user_stack_top: u64 = 0x20000000; // 512MB - safely inside 1GB
-                const stackSize: u64 = 0x4000; // 16KB
-                // const stackStartVirt = user_stack_top - stackSize;
-
-                // Allocate physical frames and map them into the user stack range
-                var i_map: u64 = 0;
-                while (i_map < (stackSize / 4096)) : (i_map += 1) {
-                    if (pmm.allocateFrame()) |frame| {
-                        vmm.map(user_stack_top - ((i_map + 1) * 4096), frame, 7);
+                // Load main executable (/bin/zsh) from block device VFS
+                const exec_path = "/bin/zsh";
+                var exec_mh_addr: u64 = 0;
+                const exec_fd_result = vfs.open(exec_path) catch -1;
+                if (exec_fd_result >= 0) {
+                    if (vfs.getFile(exec_fd_result)) |file| {
+                        const exec_data = loadFileToMemory(file);
+                        if (exec_data) |data| {
+                            const slice = extractX86_64Slice(data);
+                            if (loadMachO(slice, 0)) |exec_res| {
+                                exec_mh_addr = exec_res.text_base;
+                                kprint("Main executable loaded at 0x");
+                                kprintHex(exec_mh_addr);
+                                kprint("\n");
+                            }
+                        }
                     }
                 }
 
-                // Zero out the stack pages we just mapped
-                const sp_page: [*]u8 = @ptrFromInt(user_stack_top - stackSize);
-                _ = memset(sp_page, 0, @as(usize, stackSize));
+                if (exec_mh_addr == 0) {
+                    kprint("ERROR: Could not load main executable\n");
+                    while (true) asm volatile ("hlt");
+                }
 
-                // Sanity-check: write/read a marker at top of user stack
-                const test_ptr: *u64 = @ptrFromInt(@as(usize, @intCast(user_stack_top - 8)));
-                test_ptr.* = 0xDEADBEEF;
-                kprint("Wrote marker to user stack: ");
-                kprintHex(test_ptr.*);
-                kprint("\n");
+                setupCommpage();
+                enable_features();
 
-                const user_sp = setupDyldStack("init", res.text_base, res.entry_point, user_stack_top);
+                // Setup stack for dyld
+                const user_stack_top: u64 = 0x20000000;
+                const stackSize: u64 = 0x100000; // 1MB stack
+                _ = vmm.mmap(user_stack_top - stackSize, @intCast(stackSize), 7, -1, 0);
+
+                const user_sp = setupDyldStack(exec_path, exec_mh_addr, user_stack_top);
 
                 kprint("Jumping to dyld at 0x");
-                kprintHex(res.entry_point);
+                kprintHex(dyld_res.entry_point);
                 kprint(" SP: 0x");
                 kprintHex(user_sp);
                 kprint("\n");
 
-                if (TEST_USER_LOOP) {
-                    // Place an int3 instruction on the mapped user stack to test execution
-                    const test_entry: u64 = user_stack_top - 0x100;
-                    const entry_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(test_entry)));
-                    entry_ptr[0] = 0xCC; // int3
-                    kprint("Wrote int3 at user stack entry\n");
-
-                    // Write infinite loop and jump to it in user mode
-                    entry_ptr[0] = 0xEB;
-                    entry_ptr[1] = 0xFE;
-                    kprint("Wrote test loop at user stack entry\n");
-                    dumpCR3AndPML4();
-                    dumpPageTables(test_entry);
-                    dumpPageTables(res.entry_point);
-                    jump_to_user(test_entry, user_sp);
-                } else {
-                    dumpCR3AndPML4();
-                    dumpPageTables(res.entry_point);
-                    jump_to_user(res.entry_point, user_sp);
-                }
-            } else {
-                kprint("Failed to load dyld Mach-O\n");
+                dumpCR3AndPML4();
+                dumpPageTables(dyld_res.entry_point);
+                jump_to_user(dyld_res.entry_point, user_sp);
             }
-        } else {
-            kprint("usr/lib/dyld not found in ramdisk.\n");
         }
-    } else {
-        kprint("No ramdisk found.\n");
     }
 
     while (true) asm volatile ("hlt");
@@ -169,92 +151,62 @@ const MachOLoadResult = struct {
     text_base: u64,
 };
 
-fn dumpPageTables(virt: u64) void {
-    const pml4Index: usize = @intCast((virt >> 39) & 0x1FF);
-    const pdptIndex: usize = @intCast((virt >> 30) & 0x1FF);
-    const pdIndex: usize = @intCast((virt >> 21) & 0x1FF);
-    const ptIndex: usize = @intCast((virt >> 12) & 0x1FF);
-
-    kprint("Page tables for ");
-    kprintHex(virt);
-    kprint("\n");
-    const pml4e = vmm.pml4[pml4Index];
-    kprint(" PML4[");
-    kprintHex(@as(u64, pml4Index));
-    kprint("]: ");
-    kprintHex(pml4e);
-    kprint("\n");
-    if ((pml4e & 1) == 0) return;
-    const pdpt: [*]u64 = @ptrFromInt(@as(usize, @intCast(pml4e & ~(@as(u64, 0xFFF)))));
-    const pdpte = pdpt[pdptIndex];
-    kprint(" PDPT[");
-    kprintHex(@as(u64, pdptIndex));
-    kprint("]: ");
-    kprintHex(pdpte);
-    kprint("\n");
-    if ((pdpte & 1) == 0) return;
-    const pd: [*]u64 = @ptrFromInt(@as(usize, @intCast(pdpte & ~(@as(u64, 0xFFF)))));
-    const pde = pd[pdIndex];
-    kprint(" PD[");
-    kprintHex(@as(u64, pdIndex));
-    kprint("]: ");
-    kprintHex(pde);
-    kprint("\n");
-    if ((pde & 1) == 0) return;
-    if ((pde & @as(u64, 0x80)) != 0) {
-        kprint(" 2MB huge page\n");
-        return;
-    }
-    const pt: [*]u64 = @ptrFromInt(@as(usize, @intCast(pde & ~(@as(u64, 0xFFF)))));
-    const pte = pt[ptIndex];
-    kprint(" PT[");
-    kprintHex(@as(u64, ptIndex));
-    kprint("]: ");
-    kprintHex(pte);
-    kprint("\n");
+fn loadFileToMemory(file: *vfs.FileDescription) ?[]const u8 {
+    const size = file.node.size;
+    if (size == 0 or size > 64 * 1024 * 1024) return null;
+    const addr = vmm.mmap(0, @intCast(size), 7, -1, 0);
+    if (addr == 0) return null;
+    const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(addr)));
+    const read_bytes = file.node.read(0, @intCast(size), buf);
+    if (read_bytes == 0) return null;
+    return buf[0..read_bytes];
 }
 
-fn dumpCR3AndPML4() void {
-    var cr3: u64 = undefined;
-    asm volatile ("mov %%cr3, %[cr3]"
-        : [cr3] "=r" (cr3),
-    );
-    kprint("CR3: 0x");
-    kprintHex(cr3);
-    kprint("\n");
-
-    // Print PML4 pointer registered in vmm
-    kprint("vmm.pml4 ptr: ");
-    kprintHex(@as(u64, @intFromPtr(vmm.pml4)));
-    kprint("\n");
-
-    // Print first few PML4 entries for visibility
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        const e = vmm.pml4[i];
-        kprint("  PML4[");
-        kprintHex(@as(u64, i));
-        kprint("]: ");
-        kprintHex(e);
-        kprint("\n");
-    }
+fn byteSwap32(v: u32) u32 {
+    return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
 }
 
-const TEST_USER_LOOP: bool = false; // If true, overwrite user entry with infinite loop for testing
+fn extractX86_64Slice(data: []const u8) []const u8 {
+    if (data.len < @sizeOf(macho.FatHeader)) return data;
+    const magic = std.mem.readInt(u32, data[0..4], .little);
+    if (magic != macho.FAT_MAGIC and magic != macho.FAT_CIGAM) return data;
+
+    // FAT is big-endian
+    const narch = byteSwap32(std.mem.readInt(u32, data[4..8], .little));
+    kprint("FAT binary with ");
+    kprintHex(narch);
+    kprint(" architectures\n");
+
+    var off: usize = 8;
+    var i: u32 = 0;
+    while (i < narch) : (i += 1) {
+        if (off + @sizeOf(macho.FatArch) > data.len) break;
+        const cputype = byteSwap32(std.mem.readInt(u32, data[off..][0..4], .little));
+        const arch_offset = byteSwap32(std.mem.readInt(u32, data[off + 8 ..][0..4], .little));
+        const arch_size = byteSwap32(std.mem.readInt(u32, data[off + 12 ..][0..4], .little));
+        if (cputype == macho.CPU_TYPE_X86_64) {
+            kprint("Found x86_64 slice at offset 0x");
+            kprintHex(arch_offset);
+            kprint(" size 0x");
+            kprintHex(arch_size);
+            kprint("\n");
+            return data[arch_offset..][0..arch_size];
+        }
+        off += @sizeOf(macho.FatArch);
+    }
+    kprint("WARNING: No x86_64 slice found in FAT binary\n");
+    return data;
+}
 
 fn loadMachO(data: []const u8, slide: u64) ?MachOLoadResult {
     if (data.len < @sizeOf(macho.MachHeader64)) return null;
     const header: *const macho.MachHeader64 = @ptrCast(@alignCast(data.ptr));
 
-    if (header.magic != macho.MH_MAGIC_64) {
-        kprint("Invalid Mach-O magic\n");
-        return null;
-    }
+    if (header.magic != macho.MH_MAGIC_64) return null;
 
     var result = MachOLoadResult{ .entry_point = 0, .text_base = 0 };
     var cmd_offset: usize = @sizeOf(macho.MachHeader64);
     var i: u32 = 0;
-
     var entry_is_relative = false;
 
     while (i < header.ncmds) : (i += 1) {
@@ -264,25 +216,26 @@ fn loadMachO(data: []const u8, slide: u64) ?MachOLoadResult {
         switch (cmd.cmd) {
             macho.LC_SEGMENT_64 => {
                 const seg: *const macho.SegmentCommand64 = @ptrCast(@alignCast(cmd));
-                if (memcmp(&seg.segname, "__PAGEZERO", 10) == 0) {
-                    // skip
+                if (isSegName(&seg.segname, "__PAGEZERO")) {
+                    // Skip __PAGEZERO
                 } else {
-                    if (memcmp(&seg.segname, "__TEXT", 6) == 0) {
+                    if (isSegName(&seg.segname, "__TEXT")) {
                         result.text_base = seg.vmaddr + slide;
                     }
                     if (seg.vmsize > 0) {
                         const dest_addr = seg.vmaddr + slide;
-                        const dest: [*]u8 = @ptrFromInt(dest_addr);
-
-                        // We assume memory is writable (identity mapped)
-                        _ = memset(dest, 0, @intCast(seg.vmsize));
+                        _ = vmm.mmap(dest_addr, @intCast(seg.vmsize), 7, -1, 0);
+                        const dest: [*]u8 = @ptrFromInt(@as(usize, @intCast(dest_addr)));
                         if (seg.filesize > 0) {
-                            const src = data.ptr + seg.fileoff;
-                            _ = memcpy(dest, src, @intCast(seg.filesize));
+                            @memcpy(dest[0..@intCast(seg.filesize)], data[seg.fileoff..][0..@intCast(seg.filesize)]);
                         }
-                        kprint("Loaded seg at 0x");
+                        kprint("  seg ");
+                        kprintN(&seg.segname, 16);
+                        kprint(" -> 0x");
                         kprintHex(dest_addr);
-                        kprint("\n");
+                        kprint(" (0x");
+                        kprintHex(seg.vmsize);
+                        kprint(")\n");
                     }
                 }
             },
@@ -293,46 +246,18 @@ fn loadMachO(data: []const u8, slide: u64) ?MachOLoadResult {
             },
             macho.LC_UNIXTHREAD => {
                 const thread: *const macho.ThreadCommand = @ptrCast(@alignCast(cmd));
-                if (thread.flavor == 4) { // x86_THREAD_STATE64
-                    // RIP is at offset 144 from start of command?
-                    // cmd(4) + cmdsize(4) + flavor(4) + count(4) + rax(8)...
-                    // Let's rely on offset
+                if (thread.flavor == 4) {
                     const regs_ptr = @as([*]const u64, @ptrCast(@alignCast(@as([*]const u8, @ptrCast(cmd)) + 16)));
-                    // x86_thread_state64_t: rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp, r8..r15, rip, ...
-                    // rip is the 16th u64 (index 16)
                     result.entry_point = regs_ptr[16];
                 }
             },
             else => {},
         }
-
         cmd_offset += cmd.cmdsize;
     }
 
     if (entry_is_relative) {
-        result.entry_point += result.text_base; // Already has slide? No, text_base has slide.
-        // Wait, text_base = vmaddr + slide. entryoff is relative to vmaddr of __TEXT?
-        // Usually entryoff is relative to image load address (vmaddr 0).
-        // Let's assume result.text_base (slide + vmaddr) is the base.
-        // Actually LC_MAIN entryoff is offset from __TEXT start? Or file start?
-        // Documentation says: "The file offset of the entry point".
-        // No, `entryoff` is "The file offset of the entry point." -> File offset?
-        // But swift code says: `result.entryPoint = result.entryPoint &+ result.textBase &+ slide` (Wait, swift logic seems to check `entryIsRelative`).
-        // Swift: `result.entryPoint = result.entryPoint &+ result.textBase &+ slide`
-        // If textBase includes slide, then `result.entryPoint + textBase` is enough?
-        // Let's trust Swift: `result.entryPoint &+ result.textBase &+ slide`.
-        // My text_base ALREADY includes slide.
-        // So `entry_point + text_base` ?
-        // Or `entry_point + (text_base - slide) + slide`?
-        // Let's stick to Swift logic: `result.entryPoint + result.textBase` (if textBase is the load address).
-        // Warning: Swift logic `result.textBase = vmaddr`. My logic `result.textBase = vmaddr + slide`.
-        // So I should use `result.entry_point + (result.text_base - slide) + slide` = `result.entry_point + result.text_base`.
-        // Wait, `LC_MAIN` uses an offset relative to the `__TEXT` segment's VM address.
-        // If `__TEXT` is at 0, offset is absolute.
-        // Let's assume `entry_point + result.text_base` is correct if `text_base` is the loaded address.
-        // Actually, if `entryoff` is file offset, that's wrong for `LC_MAIN`. `LC_MAIN` usually specifies offset from vmaddr start?
-        // "File offset of the entry point" - usually this means `__TEXT` segment file offset + entryoff?
-        // Let's use `result.entry_point + result.text_base` (where text_base = loaded address).
+        result.entry_point += result.text_base;
     } else {
         result.entry_point += slide;
     }
@@ -340,42 +265,90 @@ fn loadMachO(data: []const u8, slide: u64) ?MachOLoadResult {
     return result;
 }
 
-fn setupDyldStack(exec_path: []const u8, text_base: u64, entry_point: u64, user_stack_top: u64) u64 {
-    _ = entry_point;
-    // Strings at top - 0x100
-    var string_ptr = user_stack_top - 0x100;
+fn isSegName(segname: *const [16]u8, name: []const u8) bool {
+    if (name.len > 16) return false;
+    for (0..name.len) |idx| {
+        if (segname[idx] != name[idx]) return false;
+    }
+    if (name.len < 16 and segname[name.len] != 0) return false;
+    return true;
+}
 
-    // Copy exec_path
-    const src_len = exec_path.len;
-    const dest_ptr: [*]u8 = @ptrFromInt(string_ptr - src_len - 1);
-    _ = memcpy(dest_ptr, exec_path.ptr, src_len);
-    dest_ptr[src_len] = 0;
-    string_ptr = string_ptr - src_len - 1;
-    const exec_path_addr = string_ptr;
+fn kprintN(buf: *const [16]u8, max: usize) void {
+    for (0..max) |idx| {
+        if (buf[idx] == 0) break;
+        serial_putc(buf[idx]);
+    }
+}
 
-    // Align SP
-    var sp = user_stack_top - 0x200;
+fn setupDyldStack(exec_path: []const u8, exec_mh_addr: u64, user_stack_top: u64) u64 {
+    // Place strings at top of stack area
+    var str_ptr = user_stack_top - 0x100;
+
+    // Write "executable_path=/bin/zsh" apple string
+    const apple_prefix = "executable_path=";
+    const apple_str_len = apple_prefix.len + exec_path.len + 1;
+    str_ptr -= apple_str_len;
+    const apple_str_addr = str_ptr;
+    var dest: [*]u8 = @ptrFromInt(@as(usize, @intCast(str_ptr)));
+    @memcpy(dest[0..apple_prefix.len], apple_prefix);
+    @memcpy(dest[apple_prefix.len..][0..exec_path.len], exec_path);
+    dest[apple_prefix.len + exec_path.len] = 0;
+
+    // Write argv[0] string
+    str_ptr -= exec_path.len + 1;
+    const argv0_addr = str_ptr;
+    dest = @ptrFromInt(@as(usize, @intCast(str_ptr)));
+    @memcpy(dest[0..exec_path.len], exec_path);
+    dest[exec_path.len] = 0;
+
+    // Align stack pointer
+    var sp = str_ptr - 0x100;
     sp &= ~@as(u64, 0xF);
 
-    // dyld4::KernelArgs
-    // [0] mach_header
-    // [1] argc
-    // [2] argv[0]
-    // [3] NULL
-    // [4] NULL
-    // [5] apple[0]
-    // [6] NULL
+    // Stack layout dyld expects (from bottom to top):
+    //   [0] = mh pointer (main executable Mach-O header)
+    //   [1] = argc
+    //   [2] = argv[0]
+    //   [3] = argv terminator (NULL)
+    //   [4] = envp terminator (NULL)
+    //   [5] = apple[0] = "executable_path=..."
+    //   [6] = apple terminator (NULL)
+    const frame: [*]u64 = @ptrFromInt(@as(usize, @intCast(sp - 7 * 8)));
+    frame[0] = exec_mh_addr; // Main executable's Mach-O header
+    frame[1] = 1; // argc
+    frame[2] = argv0_addr; // argv[0]
+    frame[3] = 0; // argv terminator
+    frame[4] = 0; // envp terminator
+    frame[5] = apple_str_addr; // apple[0]
+    frame[6] = 0; // apple terminator
 
-    const sp_base: [*]u64 = @ptrFromInt(sp - 7 * 8);
-    sp_base[0] = text_base;
-    sp_base[1] = 1; // argc
-    sp_base[2] = exec_path_addr;
-    sp_base[3] = 0;
-    sp_base[4] = 0;
-    sp_base[5] = exec_path_addr;
-    sp_base[6] = 0;
+    return @intFromPtr(frame);
+}
 
-    return @intFromPtr(sp_base);
+fn setupCommpage() void {
+    // XNU commpage at 0x7FFFFFE00000 (64-bit commpage base)
+    const commpage_base: u64 = 0x7FFFFFE00000;
+    _ = vmm.mmap(commpage_base, 4096, 5, -1, 0); // R-X for user
+
+    const page: [*]u8 = @ptrFromInt(@as(usize, @intCast(commpage_base)));
+    @memset(page[0..4096], 0);
+
+    // Commpage version at offset 0x1E (UInt16) — must be >= 14 for newer dyld
+    const version_ptr: *align(1) u16 = @ptrFromInt(@as(usize, @intCast(commpage_base + 0x1E)));
+    version_ptr.* = 13; // Version < 14 so dyld uses default page shift (12)
+
+    // CPU capabilities at offset 0x10 (UInt64)
+    const caps_ptr: *align(1) u64 = @ptrFromInt(@as(usize, @intCast(commpage_base + 0x10)));
+    caps_ptr.* = 0; // Basic x86_64
+
+    // Signature "commpage" at offset 0 (optional, some code checks)
+    const sig = "commpage 64";
+    @memcpy(page[0..sig.len], sig);
+
+    kprint("Commpage mapped at 0x");
+    kprintHex(commpage_base);
+    kprint("\n");
 }
 
 const MSR_STAR = 0xC0000081;
@@ -384,82 +357,33 @@ const MSR_FMASK = 0xC0000084;
 const MSR_EFER = 0xC0000080;
 
 fn enable_features() void {
-    // Enable FSGSBASE (CR4 bit 16)
     var cr4: u64 = undefined;
-    asm volatile ("mov %%cr4, %[cr4]"
-        : [cr4] "=r" (cr4),
-    );
-    cr4 |= (1 << 16);
-    asm volatile ("mov %[cr4], %%cr4"
-        :
-        : [cr4] "r" (cr4),
-    );
+    asm volatile ("mov %%cr4, %[cr4]" : [cr4] "=r" (cr4));
+    cr4 |= (1 << 16); // FSGSBASE
+    asm volatile ("mov %[cr4], %%cr4" :: [cr4] "r" (cr4));
 
-    // Enable SCE (EFER bit 0)
     var efer_lo: u32 = undefined;
     var efer_hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (efer_lo),
-          [hi] "={edx}" (efer_hi),
-        : [msr] "{ecx}" (MSR_EFER),
-    );
-    efer_lo |= 1;
-    asm volatile ("wrmsr"
-        :
-        : [lo] "{eax}" (efer_lo),
-          [hi] "{edx}" (efer_hi),
-    );
+    asm volatile ("rdmsr" : [lo] "={eax}" (efer_lo), [hi] "={edx}" (efer_hi) : [msr] "{ecx}" (@as(u32, MSR_EFER)));
+    efer_lo |= 1; // SCE
+    asm volatile ("wrmsr" :: [lo] "{eax}" (efer_lo), [hi] "{edx}" (efer_hi), [msr] "{ecx}" (@as(u32, MSR_EFER)));
 
     setup_syscalls();
 }
 
 fn setup_syscalls() void {
-    // STAR: Syscall/Sysret CS/SS configuration
-    // [63:48] Sysret CS (User CS - 16) -> 0x1B - 16 ?? No, sysret loads CS with (STAR[63:48] + 16) and SS with (STAR[63:48] + 8)
-    // Actually Linux uses: Kernel CS=0x8, User CS 32-bit=0x23??
-    // Standard x86_64:
-    //   Syscall: CS = STAR[47:32] & 0xFFFC, SS = STAR[47:32] + 8
-    //   Sysret:  CS = STAR[63:48] + 16,     SS = STAR[63:48] + 8
-    // GDT: Null(0), KCode(8), KData(16), UCode(24=0x18), UData(32=0x20)
-    // We want Syscall to load KCode(0x8). So STAR[47:32] = 0x8.
-    // We want Sysret to load UCode(0x18) and UData(0x20).
-    //   If STAR[63:48] = 0x8 (Kernel base), then CS=0x8+16=0x18 (UCode), SS=0x8+8=0x10 (KData? No).
-    //   Wait, Sysret sets SS = STAR[63:48] + 8. If we want SS=0x20 (UData), we need base 0x18?
-    //   Then CS = 0x18+16 = 0x28 (Invalid?).
-    //   Actually GDT layout is usually: KCode, KData, UData, UCode.
-    //   My GDT: 8=KCode, 16=KData, 24=UCode, 32=UData.
-    //   This is "UCode, UData" order.
-    //   Sysret: CS = Base+16, SS = Base+8.
-    //   If Base=0x10 (KData selector), then SS=0x18 (UCode??), CS=0x20 (UData??).
-    //   Inverted.
-    //   Common trick: Organize GDT as KCode, KData, UData, UCode (or compat).
-    //   Current GDT: 24(0x18)=UCode, 32(0x20)=UData.
-    //   If I use Base=0x10. SS=0x18 (UCode). CS=0x20 (UData). This is backwards for standard layout.
-    //   I should swap UCode and UData in GDT if I want standard SYSRET behavior?
-    //   Or I can live with it if I don't use SYSRET immediately?
-    //   But `dyld` might crash if I don't set it?
-    //   For now, just Setting STAR to something valid prevents #GP on `syscall`.
-
     const k_cs = 0x08;
-    const u_cs_base = 0x10; // SYSRET: CS = (base+16)|3 = 0x23, SS = (base+8)|3 = 0x1B
-
-    // Low 32: EIP (legacy setup, unused in long mode)
+    const u_cs_base = 0x10;
     const star: u64 = (@as(u64, u_cs_base) << 48) | (@as(u64, k_cs) << 32);
-
     write_msr(MSR_STAR, star);
     write_msr(MSR_LSTAR, @intFromPtr(&syscall_handler_stub));
-    write_msr(MSR_FMASK, 0); // Don't mask flags for now
+    write_msr(MSR_FMASK, 0);
 }
 
 fn write_msr(msr: u32, val: u64) void {
     const lo: u32 = @truncate(val);
     const hi: u32 = @truncate(val >> 32);
-    asm volatile ("wrmsr"
-        :
-        : [lo] "{eax}" (lo),
-          [hi] "{edx}" (hi),
-          [msr] "{ecx}" (msr),
-    );
+    asm volatile ("wrmsr" :: [lo] "{eax}" (lo), [hi] "{edx}" (hi), [msr] "{ecx}" (msr));
 }
 
 extern fn syscall_handler_stub() void;
@@ -467,22 +391,13 @@ extern fn syscall_handler_stub() void;
 fn jump_to_user(entry: u64, sp: u64) noreturn {
     const user_cs: u64 = 0x23; // 0x20 | 3
     const user_ss: u64 = 0x1B; // 0x18 | 3
-    const rflags: u64 = 0x202; // IF=1, bit 1=1
+    const rflags: u64 = 0x202;
 
-    // Debug print
     kprint("IRETQ to User Mode:\n");
-    kprint("  RIP: ");
-    kprintHex(entry);
-    kprint("\n");
-    kprint("  RSP: ");
-    kprintHex(sp);
-    kprint("\n");
-    kprint("  CS:  ");
-    kprintHex(user_cs);
-    kprint("\n");
-    kprint("  SS:  ");
-    kprintHex(user_ss);
-    kprint("\n");
+    kprint("  RIP: "); kprintHex(entry); kprint("\n");
+    kprint("  RSP: "); kprintHex(sp); kprint("\n");
+    kprint("  CS:  "); kprintHex(user_cs); kprint("\n");
+    kprint("  SS:  "); kprintHex(user_ss); kprint("\n");
 
     asm volatile (
         \\ mov %[ss], %%ds
@@ -496,26 +411,53 @@ fn jump_to_user(entry: u64, sp: u64) noreturn {
         \\ pushq %[entry]
         \\ iretq
         :
-        : [ss] "r" (user_ss),
-          [sp] "r" (sp),
-          [rflags] "r" (rflags),
-          [cs] "r" (user_cs),
-          [entry] "r" (entry),
+        : [ss] "r" (user_ss), [sp] "r" (sp), [rflags] "r" (rflags), [cs] "r" (user_cs), [entry] "r" (entry),
     );
     while (true) {}
 }
 
-// ... serial_init, serial_putc, kprint, kprintHex ...
+fn dumpPageTables(virt: u64) void {
+    const pml4Index: usize = @intCast((virt >> 39) & 0x1FF);
+    const pdptIndex: usize = @intCast((virt >> 30) & 0x1FF);
+    const pdIndex: usize = @intCast((virt >> 21) & 0x1FF);
+    const ptIndex: usize = @intCast((virt >> 12) & 0x1FF);
+
+    kprint("Page tables for "); kprintHex(virt); kprint("\n");
+    const pml4e = vmm.pml4[pml4Index];
+    kprint(" PML4["); kprintHex(@as(u64, pml4Index)); kprint("]: "); kprintHex(pml4e); kprint("\n");
+    if ((pml4e & 1) == 0) return;
+    const pdpt: [*]u64 = @ptrFromInt(@as(usize, @intCast(pml4e & ~(@as(u64, 0xFFF)))));
+    const pdpte = pdpt[pdptIndex];
+    kprint(" PDPT["); kprintHex(@as(u64, pdptIndex)); kprint("]: "); kprintHex(pdpte); kprint("\n");
+    if ((pdpte & 1) == 0) return;
+    const pd: [*]u64 = @ptrFromInt(@as(usize, @intCast(pdpte & ~(@as(u64, 0xFFF)))));
+    const pde = pd[pdIndex];
+    kprint(" PD["); kprintHex(@as(u64, pdIndex)); kprint("]: "); kprintHex(pde); kprint("\n");
+    if ((pde & 1) == 0) return;
+    if ((pde & @as(u64, 0x80)) != 0) {
+        kprint(" 2MB huge page\n"); return;
+    }
+    const pt: [*]u64 = @ptrFromInt(@as(usize, @intCast(pde & ~(@as(u64, 0xFFF)))));
+    const pte = pt[ptIndex];
+    kprint(" PT["); kprintHex(@as(u64, ptIndex)); kprint("]: "); kprintHex(pte); kprint("\n");
+}
+
+fn dumpCR3AndPML4() void {
+    var cr3: u64 = undefined;
+    asm volatile ("mov %%cr3, %[cr3]" : [cr3] "=r" (cr3));
+    kprint("CR3: 0x"); kprintHex(cr3); kprint("\n");
+    kprint("vmm.pml4 ptr: "); kprintHex(@as(u64, @intFromPtr(vmm.pml4))); kprint("\n");
+}
 
 fn serial_init() void {
     const COM1 = 0x3f8;
-    outb(COM1 + 1, 0x00); // Disable all interrupts
-    outb(COM1 + 3, 0x80); // Enable DLAB (set baud rate divisor)
-    outb(COM1 + 0, 0x03); // Set divisor to 3 (38400 baud)
     outb(COM1 + 1, 0x00);
-    outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit
-    outb(COM1 + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
-    outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set
+    outb(COM1 + 3, 0x80);
+    outb(COM1 + 0, 0x03);
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);
+    outb(COM1 + 2, 0xC7);
+    outb(COM1 + 4, 0x0B);
 }
 
 fn serial_putc(c: u8) void {
@@ -525,9 +467,7 @@ fn serial_putc(c: u8) void {
 }
 
 pub fn kprint(s: []const u8) void {
-    for (s) |c| {
-        serial_putc(c);
-    }
+    for (s) |c| serial_putc(c);
 }
 
 pub fn kprintHex(v: u64) void {
@@ -541,242 +481,392 @@ pub fn kprintHex(v: u64) void {
 }
 
 fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-    );
+    asm volatile ("outb %[val], %[port]" :: [val] "{al}" (val), [port] "{dx}" (port));
 }
 
 fn inb(port: u16) u8 {
-    return asm volatile ("inb %[port], %[ret]"
-        : [ret] "={al}" (-> u8),
-        : [port] "{dx}" (port),
-    );
-}
-
-// OS Runtime Support
-pub export fn memcpy(noalias dest: [*]u8, noalias src: [*]const u8, n: usize) [*]u8 {
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        dest[i] = src[i];
-    }
-    return dest;
-}
-
-pub export fn memset(dest: [*]u8, c: u8, n: usize) [*]u8 {
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        dest[i] = c;
-    }
-    return dest;
-}
-
-pub export fn memmove(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
-    if (@intFromPtr(dest) < @intFromPtr(src)) {
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            dest[i] = src[i];
-        }
-    } else {
-        var i: usize = n;
-        while (i > 0) {
-            i -= 1;
-            dest[i] = src[i];
-        }
-    }
-    return dest;
-}
-
-pub export fn memcmp(s1: [*]const u8, s2: [*]const u8, n: usize) i32 {
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (s1[i] < s2[i]) return -1;
-        if (s1[i] > s2[i]) return 1;
-    }
-    return 0;
+    return asm volatile ("inb %[port], %[ret]" : [ret] "={al}" (-> u8) : [port] "{dx}" (port));
 }
 
 pub export fn syscall_dispatch(nr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) u64 {
-    kprint("SYSCALL: 0x");
-    kprintHex(nr);
-    kprint("\n");
+    kprint("SYSCALL: 0x"); kprintHex(nr);
+    kprint(" ("); kprintHex(arg1); kprint(", "); kprintHex(arg2); kprint(", "); kprintHex(arg3); kprint(")");
 
-    _ = arg4;
-    _ = arg5;
-    _ = arg6;
-
-    // Mask off the class bits (e.g. 0x2000000)
-    // BSD syscalls are class 2.
-    // 0x2000004 => 4
     const class = nr >> 24;
-    const call_nr = nr & 0xFFFFFF; // Full number without class? No, class is high byte?
-    // 0x2000004 -> Class 2 (0x02), Nr 4.
-    // 0x100001C -> Class 1 (0x01), Nr 28.
-    // 0x3000003 -> Class 3 (0x03), Nr 3.
+    const call_nr = nr & 0xFFFFFF;
 
-    // Mach Traps (Class 1) often just use low bits.
-    // BSD (Class 2).
-    // MDEP (Class 3).
+    const res = dispatch(class, call_nr, arg1, arg2, arg3, arg4, arg5, arg6);
+    kprint(" -> 0x"); kprintHex(res); kprint("\n");
+    return res;
+}
 
-    // We switch on the FULL number for simplicity if small enough, but switch on logic is cleaner.
-
+fn dispatch(class: u64, call_nr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) u64 {
     if (class == 0x01) { // Mach
-        const trap = call_nr;
-        switch (trap) {
-            10 => { // _kernelrpc_mach_vm_allocate_trap(target, *addr, size, flags)
-                // We should write back the allocated address if *addr is valid?
-                // arg2 is pointer to address.
-                // Simple hack: don't write back, return 0 (KERN_SUCCESS).
-                // Wait, if we don't write back, caller sees garbage.
-                // We should probably write some address.
-                // But we don't have VM allocator yet!
-                // Just return success.
+        switch (call_nr) {
+            10 => { // _kernelrpc_mach_vm_allocate_trap(target, addr_p, size, flags)
+                const addr_ptr: ?*u64 = @ptrFromInt(@as(usize, @intCast(arg2)));
+                const size = arg3;
+                const addr = vmm.mmap(0, @intCast(size), 7, -1, 0);
+                if (addr_ptr) |p| p.* = addr;
                 return 0;
             },
-            12 => return 0, // vm_deallocate
-            14 => { // _kernelrpc_mach_vm_map_trap
+            12 => return 0, // _kernelrpc_mach_vm_deallocate_trap
+            14 => return 0, // _kernelrpc_mach_vm_protect_trap
+            15 => return 0, // _kernelrpc_mach_vm_map_trap
+            16 => { // _kernelrpc_mach_port_allocate_trap(target, right, name_out)
+                const name_ptr: ?*u32 = @ptrFromInt(@as(usize, @intCast(arg3)));
+                const name = mach_ipc.machPortAllocate(@truncate(arg2));
+                if (name_ptr) |p| p.* = name;
                 return 0;
             },
-            15 => { // port_allocate
-                // Write back port? arg2 is pointer to port name.
-                // const port_ptr: *u32 = @ptrFromInt(arg2);
-                // port_ptr.* = 0x100;
+            18 => return 0, // _kernelrpc_mach_port_deallocate_trap
+            19 => return 0, // _kernelrpc_mach_port_mod_refs_trap
+            21 => return 0, // _kernelrpc_mach_port_insert_right_trap
+            24 => { // _kernelrpc_mach_port_construct_trap(target, options, context, name_out)
+                const name_ptr: ?*u32 = @ptrFromInt(@as(usize, @intCast(arg4)));
+                const name = mach_ipc.machPortAllocate(1);
+                if (name_ptr) |p| p.* = name;
                 return 0;
             },
-            26 => return 5, // mach_reply_port
-            27 => return 6, // thread_self_trap
-            28 => return 7, // task_self_trap
-            29 => return 8, // host_self_trap
-            31 => { // mach_msg_trap
-                // args: msg, option, send_size, rcv_size, rcv_name, timeout, notify
-                const msg_ptr: *MachMessageHeader = @ptrFromInt(arg1);
-                const option = arg2;
-                _ = msg_ptr;
-                _ = option;
-
-                // Debug print msg id
-                // kprint("mach_msg id=");
-                // kprintHex(msg_ptr.msgh_id);
-                // kprint(" opt=");
-                // kprintHex(option);
-                // kprint("\n");
-
-                // If MACH_RCV_MSG (bit 1) is set, we might need to wait or return timeout?
-                // If timeout is 0, return TIMEOUT immediately if no message?
-                // For now, if SEND and RCV are set, we just pretend we sent and didn't receive?
-                // Or return SUCCESS?
-                // Logic from Swift kernel: if RCV is set, return various codes.
-
-                return 0; // MACH_MSG_SUCCESS
-            },
+            25 => return 0, // _kernelrpc_mach_port_destruct_trap
+            26 => return mach_ipc.machReplyPort(),
+            27 => return 0x203, // thread_self_trap
+            28 => return mach_ipc.machTaskSelf(),
+            29 => return mach_ipc.machHostSelf(),
+            31, 32 => return mach_ipc.handleMachMsg(arg1, @truncate(arg2), @truncate(arg3), @truncate(arg4), @truncate(arg5), @truncate(arg6)),
+            33 => return 0, // semaphore_signal_trap
+            36 => return 0, // semaphore_wait_trap
             else => {
-                kprint("Unknown Mach Trap: ");
-                kprintHex(trap);
-                kprint("\n");
-                return 0; // KERN_SUCCESS
+                kprint("  [unhandled Mach "); kprintHex(call_nr); kprint("]\n");
+                return 0;
             },
         }
     } else if (class == 0x03) { // MDEP
         if (call_nr == 3) {
-            // thread_fast_set_cthread_self
-            write_msr(0xC0000101, arg1); // GS_BASE
+            write_msr(0xC0000102, arg1);
             return 0;
         }
-        kprint("Unknown MDEP syscall: ");
-        kprintHex(call_nr);
-        kprint("\n");
         return 0;
-    } else { // BSD (Class 2) or generic
-        const sys = call_nr & 0x1FF; // Mask to 511
-        switch (sys) {
+    } else { // BSD
+        switch (call_nr) {
             1 => { // exit
-                kprint("Process exited with code: ");
-                kprintHex(arg1);
-                kprint("\n");
+                kprint("Process exited code: "); kprintHex(arg1); kprint("\n");
                 while (true) asm volatile ("hlt");
             },
-            3 => return 0, // read (stub)
+            3 => { // read
+                const fd: i32 = @bitCast(@as(u32, @truncate(arg1)));
+                if (vfs.getFile(fd)) |file| {
+                    const bytes = file.node.read(file.offset, @intCast(arg3), @ptrFromInt(@as(usize, @intCast(arg2))));
+                    file.offset += bytes;
+                    return bytes;
+                }
+                // Return random data for unknown fds (e.g. /dev/random proxy)
+                const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(arg2)));
+                fillRandom(buf[0..arg3]);
+                return arg3;
+            },
             4 => { // write
                 const fd = arg1;
-                const buf: [*]const u8 = @ptrFromInt(arg2);
+                const buf: [*]const u8 = @ptrFromInt(@as(usize, @intCast(arg2)));
                 const count = arg3;
                 if (fd == 1 or fd == 2) {
-                    var i: usize = 0;
-                    while (i < count) : (i += 1) {
-                        if (buf[i] == 10) serial_putc(13);
-                        serial_putc(buf[i]);
+                    var idx: usize = 0;
+                    while (idx < count) : (idx += 1) {
+                        serial_putc(buf[idx]);
                     }
                     return count;
                 }
                 return count;
             },
+            5 => { // open
+                const path: [*:0]const u8 = @ptrFromInt(@as(usize, @intCast(arg1)));
+                const path_slice = std.mem.span(path);
+                kprint("open(\"");
+                kprint(path_slice);
+                kprint("\")");
+                const fd = vfs.open(path_slice) catch -1;
+                if (fd == -1) {
+                    kprint(" -> ENOENT\n");
+                    return @as(u64, @bitCast(@as(i64, -2))); // ENOENT
+                }
+                return @as(u64, @bitCast(@as(i64, fd)));
+            },
+            6 => { vfs.close(@intCast(arg1)); return 0; }, // close
             20 => return 1, // getpid
-            33 => return 0, // access (success)
+            24, 25 => return 0, // getuid, geteuid
+            33 => return @as(u64, @bitCast(@as(i64, -2))), // access -> ENOENT
+            43, 47 => return 0, // getegid, getgid
+            46 => return 0, // sigaction
+            48 => { // sigprocmask
+                if (arg3 != 0) {
+                    const oset: *u64 = @ptrFromInt(@as(usize, @intCast(arg3)));
+                    oset.* = 0;
+                }
+                return 0;
+            },
+            54 => return 0, // ioctl
+            73 => return 0, // munmap
             74 => return 0, // mprotect
+            90 => return arg2, // dup2
+            92 => return 0, // fcntl
+            121 => { // writev
+                if (arg2 == 0) return 0;
+                const iov: [*]const [2]u64 = @ptrFromInt(@as(usize, @intCast(arg2)));
+                var total: u64 = 0;
+                var idx: usize = 0;
+                while (idx < arg3) : (idx += 1) {
+                    const base = iov[idx][0];
+                    const len = iov[idx][1];
+                    if (base != 0 and len > 0) {
+                        const buf: [*]const u8 = @ptrFromInt(@as(usize, @intCast(base)));
+                        var j: usize = 0;
+                        while (j < len) : (j += 1) {
+                            serial_putc(buf[j]);
+                        }
+                        total += len;
+                    }
+                }
+                return total;
+            },
+            169, 170 => return 0, // csops, csops_audittoken
+            194 => { // getrlimit
+                if (arg2 != 0) {
+                    const rlp: [*]u64 = @ptrFromInt(@as(usize, @intCast(arg2)));
+                    rlp[0] = 0x800000; // 8MB cur
+                    rlp[1] = 0x800000; // 8MB max
+                }
+                return 0;
+            },
+            195 => return 0, // setrlimit
             197 => { // mmap
-                if (arg1 != 0) return arg1;
-                return 0x80000000;
+                const fd: i32 = @bitCast(@as(u32, @truncate(arg5)));
+                return vmm.mmap(arg1, @intCast(arg2), 7, fd, arg6);
             },
-            202 => return 0, // sysctl (success?)
-            294 => { // shared_region_check_np(u64 *start_address)
+            202 => { // sysctl
+                return handleSysctl(arg1, arg2, arg3, arg4);
+            },
+            274 => return 0, // sysctlbyname
+            294 => { // shared_region_check_np
                 if (arg1 != 0) {
-                    const ptr: *u64 = @ptrFromInt(arg1);
-                    ptr.* = 0; // No shared region
+                    const ptr: *u64 = @ptrFromInt(@as(usize, @intCast(arg1)));
+                    ptr.* = 0;
                 }
                 return 0;
             },
-            302 => return 0, // __pthread_sigmask
-            327 => return 0, // issetugid
-            372 => return 6, // thread_selfid (match thread port?)
-            500 => { // getentropy(buf, len)
-                const buf: [*]u8 = @ptrFromInt(arg1);
-                const len = arg2;
-                var i: usize = 0;
-                while (i < len) : (i += 1) {
-                    buf[i] = @truncate(i); // simple pattern
+            302, 327 => return 0, // __pthread_mutex_init, issetugid
+            336 => return 0, // proc_info
+            338 => { // stat64
+                const path: [*:0]const u8 = @ptrFromInt(@as(usize, @intCast(arg1)));
+                const path_slice = std.mem.span(path);
+                kprint("stat64(\"");
+                kprint(path_slice);
+                kprint("\")\n");
+                if (vfs.resolve(path_slice)) |node| {
+                    return fillStatBuf(arg2, node);
                 }
+                return @as(u64, @bitCast(@as(i64, -2))); // ENOENT
+            },
+            339 => { // fstat64
+                const fd: i32 = @bitCast(@as(u32, @truncate(arg1)));
+                if (vfs.getFile(fd)) |file| {
+                    return fillStatBuf(arg2, file.node);
+                }
+                return @as(u64, @bitCast(@as(i64, -9))); // EBADF
+            },
+            340 => return @as(u64, @bitCast(@as(i64, -2))), // lstat64 -> ENOENT
+            366 => return 0, // bsdthread_register
+            372 => return 1, // thread_selfid
+            396 => { // read_nocancel
+                const fd: i32 = @bitCast(@as(u32, @truncate(arg1)));
+                if (vfs.getFile(fd)) |file| {
+                    const bytes = file.node.read(file.offset, @intCast(arg3), @ptrFromInt(@as(usize, @intCast(arg2))));
+                    file.offset += bytes;
+                    return bytes;
+                }
+                return @as(u64, @bitCast(@as(i64, -9)));
+            },
+            397 => { // write_nocancel
+                const buf: [*]const u8 = @ptrFromInt(@as(usize, @intCast(arg2)));
+                if (arg1 == 1 or arg1 == 2) {
+                    var idx: usize = 0;
+                    while (idx < arg3) : (idx += 1) serial_putc(buf[idx]);
+                    return arg3;
+                }
+                return arg3;
+            },
+            398 => { // open_nocancel
+                const path: [*:0]const u8 = @ptrFromInt(@as(usize, @intCast(arg1)));
+                const path_slice = std.mem.span(path);
+                kprint("open(\"");
+                kprint(path_slice);
+                kprint("\")");
+                const fd = vfs.open(path_slice) catch -1;
+                if (fd == -1) {
+                    kprint(" -> ENOENT\n");
+                    return @as(u64, @bitCast(@as(i64, -2)));
+                }
+                return @as(u64, @bitCast(@as(i64, fd)));
+            },
+            399 => { vfs.close(@intCast(arg1)); return 0; }, // close_nocancel
+            500 => { // getentropy
+                const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(arg1)));
+                fillRandom(buf[0..arg2]);
                 return 0;
+            },
+            520 => { // terminate_with_payload
+                kprint("terminate_with_payload(pid="); kprintHex(arg1); kprint(")\n");
+                while (true) asm volatile ("hlt");
+            },
+            521 => { // abort_with_payload
+                kprint("abort_with_payload()\n");
+                while (true) asm volatile ("hlt");
             },
             else => {
-                kprint("Unknown BSD syscall: ");
-                kprintHex(nr); // Print full NR
-                kprint("\n");
-                return 0; // Success? Or -1?
+                kprint("  [unhandled BSD "); kprintHex(call_nr); kprint("]\n");
+                return 0;
             },
         }
     }
 }
 
-// Exception Handler
+fn handleSysctl(name_addr: u64, namelen: u64, oldp_addr: u64, oldlenp_addr: u64) u64 {
+    if (namelen < 2) return 0;
+    const name: [*]const i32 = @ptrFromInt(@as(usize, @intCast(name_addr)));
+    const mib0 = name[0];
+    const mib1 = name[1];
+
+    // CTL_KERN=1, KERN_OSTYPE=1
+    if (mib0 == 1 and mib1 == 1) {
+        if (oldp_addr != 0) {
+            const oldp: [*]u8 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            const ostype = "Darwin";
+            @memcpy(oldp[0..ostype.len], ostype);
+            oldp[ostype.len] = 0;
+        }
+        if (oldlenp_addr != 0) {
+            const lenp: *u64 = @ptrFromInt(@as(usize, @intCast(oldlenp_addr)));
+            lenp.* = 7;
+        }
+        return 0;
+    }
+    // CTL_KERN=1, KERN_OSRELEASE=2
+    if (mib0 == 1 and mib1 == 2) {
+        if (oldp_addr != 0) {
+            const oldp: [*]u8 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            const osrel = "23.0.0";
+            @memcpy(oldp[0..osrel.len], osrel);
+            oldp[osrel.len] = 0;
+        }
+        if (oldlenp_addr != 0) {
+            const lenp: *u64 = @ptrFromInt(@as(usize, @intCast(oldlenp_addr)));
+            lenp.* = 7;
+        }
+        return 0;
+    }
+    // CTL_KERN=1, KERN_VERSION=4
+    if (mib0 == 1 and mib1 == 4) {
+        if (oldp_addr != 0) {
+            const oldp: [*]u8 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            const ver = "ZigOS 0.1";
+            @memcpy(oldp[0..ver.len], ver);
+            oldp[ver.len] = 0;
+        }
+        if (oldlenp_addr != 0) {
+            const lenp: *u64 = @ptrFromInt(@as(usize, @intCast(oldlenp_addr)));
+            lenp.* = 10;
+        }
+        return 0;
+    }
+    // CTL_KERN=1, KERN_OSVERSION=65
+    if (mib0 == 1 and mib1 == 65) {
+        if (oldp_addr != 0) {
+            const oldp: [*]u8 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            const build = "23A344";
+            @memcpy(oldp[0..build.len], build);
+            oldp[build.len] = 0;
+        }
+        if (oldlenp_addr != 0) {
+            const lenp: *u64 = @ptrFromInt(@as(usize, @intCast(oldlenp_addr)));
+            lenp.* = 7;
+        }
+        return 0;
+    }
+    // CTL_HW=6, HW_NCPU=3
+    if (mib0 == 6 and mib1 == 3) {
+        if (oldp_addr != 0) {
+            const oldp: *i32 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            oldp.* = 1;
+        }
+        return 0;
+    }
+    // CTL_HW=6, HW_MEMSIZE=24
+    if (mib0 == 6 and mib1 == 24) {
+        if (oldp_addr != 0) {
+            const oldp: *u64 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            oldp.* = 1024 * 1024 * 1024; // 1GB
+        }
+        return 0;
+    }
+    // CTL_HW=6, HW_PAGESIZE=7
+    if (mib0 == 6 and mib1 == 7) {
+        if (oldp_addr != 0) {
+            const oldp: *i32 = @ptrFromInt(@as(usize, @intCast(oldp_addr)));
+            oldp.* = 4096;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+fn fillStatBuf(stat_addr: u64, node: *const vfs.VNode) u64 {
+    const stat_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(stat_addr)));
+    @memset(stat_ptr[0..144], 0);
+    // st_mode at offset 4 (UInt16): S_IFREG=0x8000 | 0o644
+    const mode: u16 = if (node.type == .file) 0x8000 | 0o644 else 0x4000 | 0o755;
+    const mode_ptr: *align(1) u16 = @ptrFromInt(@as(usize, @intCast(stat_addr + 4)));
+    mode_ptr.* = mode;
+    // st_size at offset 96 (Int64)
+    const size_ptr: *align(1) u64 = @ptrFromInt(@as(usize, @intCast(stat_addr + 96)));
+    size_ptr.* = node.size;
+    return 0;
+}
+
+pub fn fillRandom(buffer: []u8) void {
+    var val: u64 = 0;
+    asm volatile ("rdrand %[val]" : [val] "=r" (val) :: "cc");
+    var r = std.Random.DefaultPrng.init(val);
+    r.random().bytes(buffer);
+}
+
 pub export fn exception_handler(vector: u64, err_code: u64, rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64) callconv(.c) void {
-    kprint("\nEXCEPTION: ");
-    kprintHex(vector);
-    kprint(" Error: ");
-    kprintHex(err_code);
-    kprint("\nRIP: ");
-    kprintHex(rip);
-    kprint(" CS: ");
-    kprintHex(cs);
-    kprint(" RFLAGS: ");
-    kprintHex(rflags);
-    kprint("\nRSP: ");
-    kprintHex(rsp);
-    kprint(" SS: ");
-    kprintHex(ss);
+    kprint("\nEXCEPTION: "); kprintHex(vector);
+    kprint(" Error: "); kprintHex(err_code);
+    kprint("\nRIP: "); kprintHex(rip);
+    kprint(" CS: "); kprintHex(cs);
+    kprint(" RFLAGS: "); kprintHex(rflags);
+    kprint("\nRSP: "); kprintHex(rsp);
+    kprint(" SS: "); kprintHex(ss);
 
     var ds: u64 = 0;
     asm volatile ("mov %%ds, %[ds]" : [ds] "=r" (ds));
-    kprint(" DS: ");
-    kprintHex(ds);
+    kprint(" DS: "); kprintHex(ds);
+
+    const MSR_GS_BASE = 0xC0000101;
+    const MSR_KERNEL_GS_BASE = 0xC0000102;
+    var gs_base: u64 = undefined;
+    var k_gs_base: u64 = undefined;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdmsr" : [lo] "={eax}" (lo), [hi] "={edx}" (hi) : [msr] "{ecx}" (@as(u32, MSR_GS_BASE)));
+    gs_base = (@as(u64, hi) << 32) | lo;
+    asm volatile ("rdmsr" : [lo] "={eax}" (lo), [hi] "={edx}" (hi) : [msr] "{ecx}" (@as(u32, MSR_KERNEL_GS_BASE)));
+    k_gs_base = (@as(u64, hi) << 32) | lo;
+    kprint(" GS: "); kprintHex(gs_base);
+    kprint(" KGS: "); kprintHex(k_gs_base);
     kprint("\n");
 
     var cr2: u64 = undefined;
-    asm volatile ("mov %%cr2, %[cr2]"
-        : [cr2] "=r" (cr2),
-    );
-    kprint("CR2:    ");
-    kprintHex(cr2);
-    kprint("\n");
+    asm volatile ("mov %%cr2, %[cr2]" : [cr2] "=r" (cr2));
+    kprint("CR2:    "); kprintHex(cr2); kprint("\n");
     while (true) asm volatile ("hlt");
 }

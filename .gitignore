@@ -2,6 +2,7 @@
 /build/
 .cache/
 ramdisk_root/
+disk_root/
 dyld_thin
 *.img
 *.log
